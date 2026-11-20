@@ -1,0 +1,26 @@
+# 本地运行缓存与数据库
+.data/
+**/.data/
+*.db
+*.db-shm
+*.db-wal
+
+# 依赖与日志
+node_modules/
+*.log
+npm-debug.log*
+
+# 环境变量与本地敏感配置
+.env
+.env.*
+
+# 临时目录、编辑器与打包压缩产物
+plan/
+tmp/
+dist/
+*.zip
+*.vsix
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

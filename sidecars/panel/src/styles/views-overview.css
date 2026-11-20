@@ -1,0 +1,585 @@
+/*
+ * 实时概览视图与通用面板卡片样式表 (views-overview.css).
+ * 包含：
+ * 1. 通用面板容器与标题头 (.panel, .panel-header, .panel-title, .panel-meta)
+ * 2. 4 格实时测速指标矩阵 (.telemetry-matrix, .matrix-cell, .cell-*)
+ * 3. 10 段上下文窗口进度条与配额填充条 (.progress-track, .progress-seg, .progress-fill)
+ * 4. 上下文双列图例网格与色块 (.ctx-legend-grid, .legend-*, .swatch)
+ * 5. 双栏布局网格与窄屏响应式断点 (.dual-grid)
+ */
+
+/* --- 1. 通用微边框面板卡片 (Architectural Precision Panels) --- */
+.panel {
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 0;
+  gap: var(--space-3);
+  padding: var(--space-4) var(--space-5);
+  background: var(--surface-panel);
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-sm);
+}
+
+.panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+
+.panel-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-primary);
+  flex: 1;
+  min-width: 0;
+}
+
+.panel-title > span:not(.agent-badge) {
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+.panel-meta {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11.5px;
+  color: var(--text-secondary);
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+/* --- 2. 多任务实时运行卡片列表与 4 格测速指标矩阵 (Live Running Tasks List & 4-Cell Telemetry Matrix) --- */
+.live-activity-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  flex-shrink: 0;
+  min-width: 0;
+}
+
+.live-task-card {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  padding: 10px 12px;
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-xs);
+  background: var(--surface-panel);
+  min-width: 0;
+}
+
+.live-task-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  min-width: 0;
+}
+
+.live-task-title-wrap {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  flex: 1;
+}
+
+.live-task-title {
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.45;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+  cursor: pointer;
+}
+
+.live-task-title:hover {
+  color: var(--accent-primary);
+}
+
+.live-task-header-right {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.live-sub-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  height: 18px;
+  padding: 0 6px;
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  background: var(--surface-panel);
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-xs);
+  cursor: pointer;
+  white-space: nowrap;
+  transition:
+    border-color var(--dur-instant) var(--ease-fast),
+    color var(--dur-instant) var(--ease-fast),
+    background-color var(--dur-instant) var(--ease-fast);
+}
+
+.live-sub-toggle:hover {
+  border-color: var(--border-strong);
+  color: var(--text-primary);
+}
+
+.live-sub-toggle.is-expanded {
+  color: var(--accent-primary);
+  border-color: var(--accent-primary-border);
+  background: var(--accent-primary-soft);
+}
+
+.live-task-main-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  padding-left: 18px;
+  line-height: 1.45;
+}
+
+.live-activity-dot {
+  color: var(--accent-primary);
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+}
+
+.live-task-card.is-waiting .live-activity-dot {
+  color: var(--metric-warn);
+}
+
+.live-task-card.is-compacting .live-activity-dot {
+  color: var(--ctx-checkpoint);
+}
+
+.live-activity-phase {
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--text-primary);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.live-activity-progress {
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--accent-primary);
+  background: var(--accent-primary-soft);
+  padding: 0 5px;
+  border-radius: var(--radius-xs);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.live-activity-sep {
+  font-size: 11.5px;
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+
+.live-activity-detail {
+  font-size: 11.5px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+  flex: 1;
+}
+
+.live-activity-elapsed {
+  font-size: 11.5px;
+  font-weight: 500;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  min-width: 28px;
+  text-align: right;
+  flex-shrink: 0;
+}
+
+.live-sub-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-top: 9px;
+  margin-top: 3px;
+  margin-left: 18px;
+  border-top: 1px dashed var(--border-hairline);
+  min-width: 0;
+}
+
+.live-sub-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-height: 22px;
+  min-width: 0;
+  font-size: 11.5px;
+  line-height: 1.45;
+}
+
+.live-sub-row.is-done {
+  opacity: 0.72;
+}
+
+.live-sub-left {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  flex: 1;
+}
+
+.live-sub-role {
+  font-weight: 600;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 148px;
+  flex-shrink: 0;
+}
+
+.live-sub-summary {
+  color: var(--text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+  flex: 1;
+}
+
+.live-sub-elapsed {
+  font-size: 11px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  min-width: 28px;
+  text-align: right;
+  flex-shrink: 0;
+}
+
+.telemetry-matrix {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  flex-shrink: 0;
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-xs);
+  background: var(--border-hairline);
+  gap: 1px;
+  overflow: hidden;
+}
+
+.matrix-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 7px 9px;
+  background: var(--surface-panel);
+  min-width: 0;
+}
+
+.cell-label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.cell-value {
+  font-size: 14.5px;
+  font-weight: 700;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.cell-value.accent-speed {
+  color: var(--metric-speed);
+}
+
+.cell-value.accent-ok {
+  color: var(--metric-ok);
+}
+
+.cell-sub {
+  font-size: 10.5px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* --- 3. 10 段上下文进度条与配额池填充条 (Context Segment Meter & Quota Progress Bars) --- */
+.progress-track {
+  width: 100%;
+  height: 6px;
+  background: var(--surface-track);
+  border-radius: var(--radius-xs);
+  overflow: hidden;
+  display: flex;
+}
+
+.progress-seg {
+  height: 100%;
+  width: var(--seg-w, 0%);
+  transition:
+    background-color 0.05s ease,
+    width var(--dur-normal) var(--ease-fast);
+}
+
+.progress-track.is-reordering .progress-seg {
+  transition:
+    background-color 0.05s ease,
+    width var(--dur-normal) var(--ease-fast) 0.05s;
+}
+
+.progress-seg.seg-assistant {
+  background-color: var(--ctx-assistant);
+}
+.progress-seg.seg-tool-results {
+  background-color: var(--ctx-tool-results);
+}
+.progress-seg.seg-user-input {
+  background-color: var(--ctx-user-input);
+}
+.progress-seg.seg-subagent-msg {
+  background-color: var(--ctx-subagent-msg);
+}
+.progress-seg.seg-checkpoint {
+  background-color: var(--ctx-checkpoint);
+}
+.progress-seg.seg-system-tools {
+  background-color: var(--ctx-system-tools);
+}
+.progress-seg.seg-mcp-tools {
+  background-color: var(--ctx-mcp-tools);
+}
+.progress-seg.seg-skills {
+  background-color: var(--ctx-skills);
+}
+.progress-seg.seg-system-prompt {
+  background-color: var(--ctx-system-prompt);
+}
+.progress-seg.seg-user-rules {
+  background-color: var(--ctx-user-rules);
+}
+.progress-seg.seg-cached {
+  background-color: var(--ctx-cached);
+}
+.progress-seg.seg-input {
+  background-color: var(--ctx-input);
+}
+.progress-seg.seg-thinking {
+  background-color: var(--ctx-thinking);
+}
+.progress-seg.seg-output {
+  background-color: var(--ctx-output);
+}
+
+.progress-fill {
+  height: 100%;
+  width: var(--fill-w, 0%);
+  background: var(--accent-primary);
+  transition: width var(--dur-normal) var(--ease-fast);
+}
+
+.progress-fill.tone-warn {
+  background: var(--metric-warn);
+}
+
+.progress-fill.tone-danger {
+  background: var(--metric-danger);
+}
+
+/* --- 4. 上下文双列图例网格 (Context 10-Channel Legend Grid) --- */
+.ctx-legend-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 5px var(--space-4);
+  padding: 2px 0 0 0;
+  background: transparent;
+  border: none;
+  font-size: 11.5px;
+}
+
+.legend-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+
+.legend-left {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.swatch {
+  width: 7px;
+  height: 7px;
+  border-radius: 1px;
+  display: inline-block;
+}
+
+.swatch.seg-assistant { background: var(--ctx-assistant); }
+.swatch.seg-tool-results { background: var(--ctx-tool-results); }
+.swatch.seg-user-input { background: var(--ctx-user-input); }
+.swatch.seg-subagent-msg { background: var(--ctx-subagent-msg); }
+.swatch.seg-checkpoint { background: var(--ctx-checkpoint); }
+.swatch.seg-system-tools { background: var(--ctx-system-tools); }
+.swatch.seg-mcp-tools { background: var(--ctx-mcp-tools); }
+.swatch.seg-skills { background: var(--ctx-skills); }
+.swatch.seg-system-prompt { background: var(--ctx-system-prompt); }
+.swatch.seg-user-rules { background: var(--ctx-user-rules); }
+
+/* --- 5. 双栏网格与窄视口响应式折叠 (Dual Grid & Responsive Breakpoints) --- */
+.dual-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--space-3);
+}
+
+/* --- 6. 上下文窗口内联代理切换器与代理徽章 (Scheme B Context Inspector & Agent Badges) --- */
+.ctx-inspector-bar {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  padding: 0;
+  background: transparent;
+  border: none;
+}
+
+.ctx-pill-group {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
+.ctx-agent-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 20px;
+  padding: 0 6px;
+  border: 1px solid var(--border-hairline);
+  background: var(--surface-panel);
+  color: var(--text-secondary);
+  font-size: 11px;
+  border-radius: var(--radius-xs);
+  cursor: pointer;
+  white-space: nowrap;
+  transition:
+    background-color var(--dur-instant) var(--ease-fast),
+    color var(--dur-instant) var(--ease-fast),
+    border-color var(--dur-instant) var(--ease-fast);
+}
+
+.ctx-agent-pill:hover {
+  border-color: var(--border-strong);
+  color: var(--text-primary);
+}
+
+.ctx-agent-pill.is-active {
+  background: var(--accent-primary-soft);
+  color: var(--accent-primary);
+  border-color: var(--accent-primary-border);
+  font-weight: 600;
+}
+
+.ctx-agent-pill.is-more-toggle {
+  border-style: dashed;
+  color: var(--text-muted);
+}
+
+.ctx-agent-pill.is-more-toggle:hover {
+  border-style: solid;
+  color: var(--text-primary);
+}
+
+.panel-title .agent-badge {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: inline-block;
+  vertical-align: middle;
+}
+
+.agent-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 1px 5px;
+  font-size: 10.5px;
+  font-weight: 600;
+  line-height: 1.25;
+  border-radius: var(--radius-xs);
+  border: 1px solid var(--border-hairline);
+  background: var(--surface-subtle);
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.agent-badge.is-clickable {
+  cursor: pointer;
+}
+
+.agent-badge.is-clickable:hover {
+  border-color: var(--border-strong);
+}
+
+.agent-badge.badge-main {
+  color: var(--accent-primary);
+  background: var(--accent-primary-soft);
+  border-color: var(--accent-primary-border);
+}
+
+.agent-badge.badge-sub-1 {
+  color: var(--ctx-mcp-tools);
+  background: color-mix(in srgb, var(--ctx-mcp-tools) 13%, transparent);
+  border-color: color-mix(in srgb, var(--ctx-mcp-tools) 35%, var(--border-hairline));
+}
+
+.agent-badge.badge-sub-2 {
+  color: var(--metric-speed);
+  background: var(--metric-speed-soft);
+  border-color: color-mix(in srgb, var(--metric-speed) 35%, var(--border-hairline));
+}
+
+.agent-badge.badge-sub-3 {
+  color: var(--metric-ok);
+  background: var(--metric-ok-soft);
+  border-color: color-mix(in srgb, var(--metric-ok) 35%, var(--border-hairline));
+}
+
+@media (max-width: 390px) {
+  .telemetry-matrix {
+    grid-template-columns: repeat(2, 1fr);
+  }
+  .dual-grid {
+    grid-template-columns: 1fr;
+  }
+}
