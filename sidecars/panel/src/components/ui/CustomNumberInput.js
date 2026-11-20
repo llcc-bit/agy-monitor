@@ -77,6 +77,7 @@ export const CustomNumberInput = defineComponent({
           commitManualInput();
         }
       },
+      onChange: () => commitManualInput(),
       onBlur: () => commitManualInput(),
     });
 
@@ -102,12 +103,13 @@ export const CustomNumberInput = defineComponent({
     }
 
     function syncFieldDisplay(val = getProps().modelValue) {
-      const { min, max } = getProps();
+      const { min, max, ariaLabel } = getProps();
       const normalized = clampValue(val);
       if (textField.value !== String(normalized)) {
         textField.value = String(normalized);
       }
       patchAttr(textField, 'aria-valuenow', normalized);
+      if (ariaLabel) patchAttr(textField, 'aria-label', ariaLabel);
       if (Number.isFinite(min)) patchAttr(textField, 'aria-valuemin', min);
       if (Number.isFinite(max)) patchAttr(textField, 'aria-valuemax', max);
     }

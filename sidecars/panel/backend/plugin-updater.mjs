@@ -34,6 +34,7 @@ import {
   cloudSyncState,
   loadJson,
   loadSettings,
+  lsRuntimeEndpoint,
   pluginUpdateState,
   saveJson,
 } from './config.mjs';
@@ -71,14 +72,39 @@ function runExecFile(cmd, args, opts = {}) {
   });
 }
 
+let customSidecarRestartHandler = null;
+
 /**
- * 更新完成后调度 Sidecar 进程平滑退出，让宿主进程监督器自动重启新代码。
+ * 注册自定义运行时热重载回调（例如 `main.mjs` 的 `Worker` 热替换或 `bridge-daemon.mjs` 的平滑退出），
+ * 避免直接调用 `process.exit(0)` 导致宿主 `SidecarApp` 固定端口失联。
+ *
+ * @param {(() => void)|null} handler
+ */
+export function setSidecarRestartHandler(handler) {
+  customSidecarRestartHandler = typeof handler === 'function' ? handler : null;
+}
+
+/**
+ * 更新完成后调度 Sidecar 运行时热重载（若未注册自定义处理器，则回退平滑退出供父监督器拉起）。
  * 在单元测试环境（`!LS_ADDR || LS_ADDR === 'test.invalid'`）下自动跳过。
  *
  * @param {number} [delayMs=350] 延迟毫秒数，确保当前 HTTP 响应先发回前端
  */
 export function scheduleSidecarRestart(delayMs = 350) {
-  if (!LS_ADDR || LS_ADDR === 'test.invalid' || typeof process?.exit !== 'function') return;
+  const activeAddr = lsRuntimeEndpoint.addr || LS_ADDR;
+  if (!activeAddr || activeAddr === 'test.invalid') return;
+  if (typeof customSidecarRestartHandler === 'function') {
+    const fn = customSidecarRestartHandler;
+    setTimeout(() => {
+      try {
+        fn();
+      } catch {
+        // 忽略自定义热重载回调异常
+      }
+    }, delayMs);
+    return;
+  }
+  if (typeof process?.exit !== 'function') return;
   setTimeout(() => {
     try {
       process.exit(0);
@@ -191,10 +217,13 @@ export function resolveMigratedGitRemoteUrl(rawUrl) {
  * @param {string} rootDir 插件根目录或解压目录
  */
 async function verifyPluginJsSyntax(rootDir) {
-  if (!LS_ADDR || LS_ADDR === 'test.invalid') return;
+  const activeAddr = lsRuntimeEndpoint.addr || LS_ADDR;
+  if (!activeAddr || activeAddr === 'test.invalid') return;
   const nodeBin = process?.execPath || 'node';
   const filesToCheck = [
     join(rootDir, 'sidecars', 'panel', 'main.mjs'),
+    join(rootDir, 'sidecars', 'panel', 'bridge-daemon.mjs'),
+    join(rootDir, 'sidecars', 'panel', 'mcp-entry.mjs'),
     join(rootDir, 'sidecars', 'panel', 'app.js'),
   ];
   for (const file of filesToCheck) {
@@ -465,7 +494,7 @@ export async function performPluginUpdate({ isAuto = false } = {}) {
               '-NoProfile',
               '-NonInteractive',
               '-Command',
-              `Expand-Archive -LiteralPath '${zipFile.replace(/'/g, "''")}' -DestinationPath '${extractDir.replace(/'/g, "''")}' -Force`,
+              `Add-Type -AssemblyName System.IO.Compression.FileSystem; [System.IO.Compression.ZipFile]::ExtractToDirectory('${zipFile.replace(/'/g, "''")}', '${extractDir.replace(/'/g, "''")}')`,
             ]);
           } else {
             await runExecFile('unzip', ['-oq', zipFile, '-d', extractDir]);

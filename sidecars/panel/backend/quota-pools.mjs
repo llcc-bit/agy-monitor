@@ -9,7 +9,8 @@
  * - Proto3 零值省略兼容：当配额耗尽（`remainingFraction === 0`）导致字段被省略且存在尚未过期的有效 `resetTime` 时，正确识别为 0% 剩余（100% 已用）。
  */
 
-import { parseIsoMs } from '../speed-metrics.mjs';
+import { parseIsoMs } from '../trajectory-metrics.mjs';
+import { THIRD_PARTY_POOL_RE } from '../shared/telemetry-display-rules.mjs';
 import {
   isArgonModelIdentifier,
   isCarbonModelIdentifier,
@@ -89,9 +90,6 @@ function classifyOfficialBucketWindow(bucket, _groupBucketCount = 1, nowMs = Dat
   }
   return 'weekly';
 }
-
-const THIRD_PARTY_POOL_RE =
-  /3p|claude|anthropic|fable|gpt|openai|oss|sonnet|opus|haiku|third[-_\s]?party/i;
 
 /**
  * 根据分组名称、分组描述及桶 ID 识别配额池归属身份（`Gemini` / `Argon` / `Carbon` / `Claude & GPT`）。

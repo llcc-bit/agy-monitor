@@ -11,6 +11,7 @@ import {
   patchClasses,
   patchKeyedList,
   patchText,
+  positionAnchoredPopup,
 } from '../../core/domPatch.js';
 import { formatCompactDateTime } from '../../core/formatters.js';
 import { createSvgIcon } from '../../icons/SvgIcon.js';
@@ -195,15 +196,47 @@ export const CustomDateTimePicker = defineComponent({
 
     const rootEl = h('div', { className: 'datetime-picker' }, [triggerBtn, popoverEl]);
 
+    function positionPopover() {
+      if (!isOpen) return;
+      positionAnchoredPopup(rootEl, triggerBtn, popoverEl, {
+        margin: 6,
+        gap: 4,
+        maxHeight: 0,
+        minFlipSpace: 260,
+      });
+    }
+
+    let boundReposition = false;
+    function handleViewportChange() {
+      if (!isOpen) return;
+      positionPopover();
+    }
+
+    function setRepositionListeners(active) {
+      if (active === boundReposition) return;
+      boundReposition = active;
+      if (typeof window !== 'undefined' && window.addEventListener) {
+        if (active) {
+          window.addEventListener('resize', handleViewportChange, { passive: true });
+          window.addEventListener('scroll', handleViewportChange, true);
+        } else {
+          window.removeEventListener('resize', handleViewportChange);
+          window.removeEventListener('scroll', handleViewportChange, true);
+        }
+      }
+    }
+
     function togglePopover(nextOpen) {
       isOpen = Boolean(nextOpen);
       patchAttr(popoverEl, 'hidden', !isOpen);
       patchAttr(triggerBtn, 'aria-expanded', isOpen ? 'true' : 'false');
+      setRepositionListeners(isOpen);
       if (isOpen) {
         const cur = new Date(getProps().modelValue || Date.now());
         viewYear = cur.getFullYear();
         viewMonth = cur.getMonth();
         renderCalendar();
+        positionPopover();
       }
     }
 
@@ -265,7 +298,12 @@ export const CustomDateTimePicker = defineComponent({
 
     if (typeof document !== 'undefined' && document.addEventListener) {
       document.addEventListener('click', handleDocClick, true);
-      onCleanup(() => document.removeEventListener('click', handleDocClick, true));
+      onCleanup(() => {
+        setRepositionListeners(false);
+        document.removeEventListener('click', handleDocClick, true);
+      });
+    } else {
+      onCleanup(() => setRepositionListeners(false));
     }
 
     syncDisplay();

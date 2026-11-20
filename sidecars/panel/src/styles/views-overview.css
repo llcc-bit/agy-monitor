@@ -31,7 +31,7 @@
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  font-size: 12px;
+  font-size: var(--fs-base);
   font-weight: 600;
   color: var(--text-primary);
   flex: 1;
@@ -47,13 +47,61 @@
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  font-size: 11.5px;
+  font-size: var(--fs-base-sm);
   color: var(--text-secondary);
   flex-shrink: 0;
   white-space: nowrap;
 }
 
+/* 配额池窗口行头：标题 + 周期用量内联（窄栏自适应截断，零额外纵向行高） */
+.quota-win-head {
+  gap: 8px;
+  min-width: 0;
+}
+
+.quota-win-left {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+  min-width: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
+}
+
+.quota-win-title {
+  font-size: var(--fs-base-sm);
+  font-weight: 500;
+  color: var(--text-primary);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.quota-win-usage {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: var(--fs-sm);
+  font-weight: 400;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
+.quota-win-meta {
+  font-size: var(--fs-md);
+  flex-shrink: 0;
+}
+
 /* --- 2. 多任务实时运行卡片列表与 4 格测速指标矩阵 (Live Running Tasks List & 4-Cell Telemetry Matrix) --- */
+.overview-modules-host {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  min-width: 0;
+  padding-bottom: 2px;
+}
+
 .live-activity-list {
   display: flex;
   flex-direction: column;
@@ -90,7 +138,7 @@
 }
 
 .live-task-title {
-  font-size: 12px;
+  font-size: var(--fs-base);
   font-weight: 600;
   line-height: 1.45;
   color: var(--text-primary);
@@ -116,20 +164,30 @@
   display: inline-flex;
   align-items: center;
   gap: 3px;
-  height: 18px;
-  padding: 0 6px;
-  font-size: 10.5px;
+  min-height: calc(18px * var(--ui-font-scale, 1));
+  padding: 1px 6px;
+  font-size: var(--fs-sm);
   font-weight: 600;
   color: var(--text-secondary);
   background: var(--surface-panel);
   border: 1px solid var(--border-hairline);
   border-radius: var(--radius-xs);
+  outline: none;
   cursor: pointer;
   white-space: nowrap;
   transition:
     border-color var(--dur-instant) var(--ease-fast),
     color var(--dur-instant) var(--ease-fast),
     background-color var(--dur-instant) var(--ease-fast);
+}
+
+.live-sub-toggle-chevron {
+  flex-shrink: 0;
+  transform: rotate(-90deg);
+}
+
+.live-sub-toggle.is-expanded .live-sub-toggle-chevron {
+  transform: rotate(0deg);
 }
 
 .live-sub-toggle:hover {
@@ -168,7 +226,7 @@
 }
 
 .live-activity-phase {
-  font-size: 11.5px;
+  font-size: var(--fs-base-sm);
   font-weight: 600;
   color: var(--text-primary);
   white-space: nowrap;
@@ -176,7 +234,7 @@
 }
 
 .live-activity-progress {
-  font-size: 10.5px;
+  font-size: var(--fs-sm);
   font-weight: 600;
   color: var(--accent-primary);
   background: var(--accent-primary-soft);
@@ -187,13 +245,13 @@
 }
 
 .live-activity-sep {
-  font-size: 11.5px;
+  font-size: var(--fs-base-sm);
   color: var(--text-muted);
   flex-shrink: 0;
 }
 
 .live-activity-detail {
-  font-size: 11.5px;
+  font-size: var(--fs-base-sm);
   color: var(--text-secondary);
   white-space: nowrap;
   overflow: hidden;
@@ -203,7 +261,7 @@
 }
 
 .live-activity-elapsed {
-  font-size: 11.5px;
+  font-size: var(--fs-base-sm);
   font-weight: 500;
   color: var(--text-secondary);
   white-space: nowrap;
@@ -212,15 +270,31 @@
   flex-shrink: 0;
 }
 
-.live-sub-list {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
+.live-sub-scroll-host {
   padding-top: 9px;
   margin-top: 3px;
   margin-left: 18px;
   border-top: 1px dashed var(--border-hairline);
   min-width: 0;
+}
+
+.live-sub-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-right: 8px;
+  min-width: 0;
+  max-height: 196px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+.live-sub-list::-webkit-scrollbar {
+  width: 0 !important;
+  height: 0 !important;
+  display: none !important;
 }
 
 .live-sub-row {
@@ -230,12 +304,20 @@
   gap: 10px;
   min-height: 22px;
   min-width: 0;
-  font-size: 11.5px;
+  font-size: var(--fs-base-sm);
   line-height: 1.45;
 }
 
 .live-sub-row.is-done {
   opacity: 0.72;
+}
+
+.live-sub-row.is-waiting-sub {
+  opacity: 0.86;
+}
+
+.live-sub-row.is-killed-sub {
+  opacity: 0.56;
 }
 
 .live-sub-left {
@@ -266,7 +348,7 @@
 }
 
 .live-sub-elapsed {
-  font-size: 11px;
+  font-size: var(--fs-md);
   color: var(--text-secondary);
   white-space: nowrap;
   min-width: 28px;
@@ -276,7 +358,7 @@
 
 .telemetry-matrix {
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
+  grid-template-columns: repeat(var(--matrix-cols, 4), minmax(0, 1fr));
   flex-shrink: 0;
   border: 1px solid var(--border-hairline);
   border-radius: var(--radius-xs);
@@ -298,12 +380,12 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
-  font-size: 11px;
+  font-size: var(--fs-md);
   color: var(--text-secondary);
 }
 
 .cell-value {
-  font-size: 14.5px;
+  font-size: var(--fs-lg);
   font-weight: 700;
   color: var(--text-primary);
   white-space: nowrap;
@@ -311,16 +393,41 @@
   text-overflow: ellipsis;
 }
 
-.cell-value.accent-speed {
+.cell-value.accent-speed,
+.accent-speed {
   color: var(--metric-speed);
 }
 
-.cell-value.accent-ok {
+.cell-value.accent-ok,
+.accent-ok,
+.cell-value.tone-good,
+.tone-good {
   color: var(--metric-ok);
 }
 
+.cell-value.tone-info,
+.tone-info {
+  color: var(--metric-info);
+}
+
+.cell-value.tone-warn,
+.tone-warn {
+  color: var(--metric-warn);
+}
+
+.cell-value.tone-danger,
+.tone-danger {
+  color: var(--metric-danger);
+}
+
+.cell-value.tone-muted,
+.tone-muted {
+  color: var(--text-muted);
+  font-weight: 500;
+}
+
 .cell-sub {
-  font-size: 10.5px;
+  font-size: var(--fs-sm);
   color: var(--text-secondary);
   white-space: nowrap;
   overflow: hidden;
@@ -349,6 +456,48 @@
   transition:
     background-color 0.05s ease,
     width var(--dur-normal) var(--ease-fast) 0.05s;
+}
+
+/* 块状微圆角风格上下文进度条（保持 6px 紧凑高度 + 色块间 2px 轻间隙 + 每段 2px 边缘圆润处理） */
+.progress-track.ctx-segment-meter {
+  height: 6px;
+  border-radius: 3px;
+  align-items: stretch;
+}
+
+.progress-track.ctx-segment-meter .progress-seg {
+  flex: 0 1 auto;
+  box-sizing: border-box;
+  width: 0%;
+  min-width: 0;
+  margin-left: 0;
+  border-radius: 2px;
+  transition:
+    background-color 0.08s ease,
+    width var(--dur-normal) var(--ease-fast),
+    margin-left var(--dur-fast) var(--ease-fast),
+    filter 120ms ease;
+}
+
+.progress-track.ctx-segment-meter.is-reordering .progress-seg {
+  transition:
+    background-color 0.05s ease,
+    width var(--dur-normal) var(--ease-fast) 0.05s,
+    margin-left var(--dur-fast) var(--ease-fast),
+    filter 120ms ease;
+}
+
+.progress-track.ctx-segment-meter .progress-seg.is-active {
+  width: var(--seg-w, 0%);
+  min-width: 3px;
+}
+
+.progress-track.ctx-segment-meter .progress-seg.is-active.has-sep {
+  margin-left: 2px;
+}
+
+.progress-track.ctx-segment-meter .progress-seg.is-active:hover {
+  filter: brightness(1.12);
 }
 
 .progress-seg.seg-assistant {
@@ -412,12 +561,12 @@
 /* --- 4. 上下文双列图例网格 (Context 10-Channel Legend Grid) --- */
 .ctx-legend-grid {
   display: grid;
-  grid-template-columns: repeat(2, 1fr);
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 5px var(--space-4);
   padding: 2px 0 0 0;
   background: transparent;
   border: none;
-  font-size: 11.5px;
+  font-size: var(--fs-base-sm);
 }
 
 .legend-item {
@@ -425,6 +574,7 @@
   align-items: center;
   justify-content: space-between;
   gap: var(--space-2);
+  min-width: 0;
 }
 
 .legend-left {
@@ -463,7 +613,7 @@
 /* --- 6. 上下文窗口内联代理切换器与代理徽章 (Scheme B Context Inspector & Agent Badges) --- */
 .ctx-inspector-bar {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   width: 100%;
   padding: 0;
   background: transparent;
@@ -482,12 +632,13 @@
   display: inline-flex;
   align-items: center;
   gap: 4px;
-  height: 20px;
-  padding: 0 6px;
+  min-height: calc(20px * var(--ui-font-scale, 1));
+  padding: 1px 6px;
   border: 1px solid var(--border-hairline);
+  outline: none;
   background: var(--surface-panel);
   color: var(--text-secondary);
-  font-size: 11px;
+  font-size: var(--fs-md);
   border-radius: var(--radius-xs);
   cursor: pointer;
   white-space: nowrap;
@@ -519,6 +670,14 @@
   color: var(--text-primary);
 }
 
+.ctx-toggle-chevron {
+  flex-shrink: 0;
+}
+
+.ctx-agent-pill.is-more-toggle.is-expanded .ctx-toggle-chevron {
+  transform: rotate(180deg);
+}
+
 .panel-title .agent-badge {
   flex: 0 1 auto;
   min-width: 0;
@@ -533,7 +692,7 @@
   align-items: center;
   gap: 3px;
   padding: 1px 5px;
-  font-size: 10.5px;
+  font-size: var(--fs-sm);
   font-weight: 600;
   line-height: 1.25;
   border-radius: var(--radius-xs);
@@ -576,8 +735,8 @@
 }
 
 @media (max-width: 390px) {
-  .telemetry-matrix {
-    grid-template-columns: repeat(2, 1fr);
+  .telemetry-matrix:not([data-cols="1"]):not([data-cols="2"]) {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
   .dual-grid {
     grid-template-columns: 1fr;

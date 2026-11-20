@@ -90,12 +90,14 @@ export const TopLongPillNav = defineComponent({
         }
 
         patchText(entry.labelEl, item.label);
-        if (item.badge !== undefined && item.badge !== null && item.badge !== '') {
+        const hasBadge = item.badge !== undefined && item.badge !== null && item.badge !== '';
+        if (hasBadge) {
           patchAttr(entry.badgeEl, 'hidden', false);
           patchText(entry.badgeEl, `(${item.badge})`);
         } else {
           patchAttr(entry.badgeEl, 'hidden', true);
         }
+        patchAttr(entry.btn, 'title', hasBadge ? `${item.label} (${item.badge})` : item.label);
 
         const isActive = item.value === modelValue;
         patchClasses(entry.btn, { 'is-active': isActive });

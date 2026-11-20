@@ -6,8 +6,15 @@
 
 import { defineComponent } from './core/component.js';
 import { h, patchAttr } from './core/domPatch.js';
-import { resolveScopedConversation, telemetryStore } from './store/telemetryStore.js';
-import { uiStore, VIEW_TABS } from './store/uiStore.js';
+import { isWindowOverlayMode } from './core/httpClient.js';
+import { i18nStore } from './i18n/index.js';
+import {
+  normalizeClientWindowMountMode,
+  resolveScopedConversation,
+  telemetryStore,
+} from './store/telemetryStore.js';
+import { getViewTabs, uiStore } from './store/uiStore.js';
+import { BridgeStatusNotice } from './components/settings/BridgeStatusNotice.js';
 import { TopSessionHeader } from './components/layout/TopSessionHeader.js';
 import { TopLongPillNav } from './components/ui/TopLongPillNav.js';
 import { LiveOverviewView } from './views/LiveOverviewView.js';
@@ -21,7 +28,7 @@ export const App = defineComponent({
     const sessionHeader = TopSessionHeader();
     const topPillNav = TopLongPillNav({
       modelValue: uiStore.getState().activeView,
-      items: VIEW_TABS,
+      items: getViewTabs(),
       onUpdateModelValue: (nextView) => {
         uiStore.setState({ activeView: nextView });
       },
@@ -31,6 +38,36 @@ export const App = defineComponent({
     const consumptionView = ConsumptionView();
     const stepsView = StepsDetailView();
     const settingsView = SettingsView();
+
+    const globalBridgeNotice = BridgeStatusNotice({
+      dismissible: true,
+    });
+    const bannerSlotEl = h('div', { className: 'app-bridge-banner-slot', hidden: true }, [
+      globalBridgeNotice.el,
+    ]);
+
+    function syncGlobalBridgeBanner() {
+      const activeView = uiStore.getState().activeView;
+      const telemetry = telemetryStore.getState().telemetry;
+      const settings = telemetry?.settings;
+      const mountMode = settings
+        ? normalizeClientWindowMountMode(settings.windowMountMode, settings.enableWindowOverlay)
+        : 'sidebar';
+      const hasCtxOverrides = Boolean(
+        settings?.modelContextWindows && Object.keys(settings.modelContextWindows).length > 0
+      );
+      const shouldOfferGlobal =
+        !isWindowOverlayMode() &&
+        activeView !== 'settings' &&
+        (mountMode !== 'sidebar' || hasCtxOverrides);
+      globalBridgeNotice.refs.update({
+        visible: shouldOfferGlobal,
+        contextMode: mountMode === 'sidebar' && hasCtxOverrides,
+        windowBridge: telemetry?.windowBridge || null,
+        hostPlatform: telemetry?.hostPlatform || 'win32',
+      });
+      patchAttr(bannerSlotEl, 'hidden', globalBridgeNotice.el.hasAttribute('hidden'));
+    }
 
     const viewMap = {
       overview: overviewView.el,
@@ -48,6 +85,7 @@ export const App = defineComponent({
 
     const shellEl = h('main', { className: 'app-shell' }, [
       h('div', { className: 'top-deck' }, [sessionHeader.el, topPillNav.el]),
+      bannerSlotEl,
       stageEl,
     ]);
 
@@ -61,8 +99,10 @@ export const App = defineComponent({
       );
       const stepCount = scopedConv?.stepCount ?? 0;
       topPillNav.setProps({
-        items: VIEW_TABS.map((t) =>
-          t.value === 'steps' ? { ...t, badge: stepCount > 0 ? stepCount : '' } : t
+        items: getViewTabs().map((tabItem) =>
+          tabItem.value === 'steps'
+            ? { ...tabItem, badge: stepCount > 0 ? stepCount : '' }
+            : tabItem
         ),
       });
     }
@@ -79,12 +119,14 @@ export const App = defineComponent({
         } else if (activeView === 'consumption') {
           consumptionView.refs?.viewScrollbar?.refresh();
         } else if (activeView === 'steps') {
+          stepsView.refs?.refreshStepTableViewport?.();
           stepsView.refs?.stepsScroll?.refresh();
           stepsView.refs?.modelsScroll?.refresh();
         } else if (activeView === 'settings') {
           settingsView.refs?.viewScrollbar?.refresh();
         }
         syncStepsBadge();
+        syncGlobalBridgeBanner();
       }
     );
 
@@ -93,8 +135,16 @@ export const App = defineComponent({
         stepCount: st.telemetry?.activeConversation?.stepCount ?? 0,
         totalStepsAllAgents: st.telemetry?.activeConversation?.totalStepsAllAgents ?? 0,
         subagentCount: st.telemetry?.activeConversation?.subagentCount ?? 0,
+        windowMountMode: st.telemetry?.settings?.windowMountMode,
+        enableWindowOverlay: st.telemetry?.settings?.enableWindowOverlay,
+        modelContextWindows: st.telemetry?.settings?.modelContextWindows,
+        windowBridge: st.telemetry?.windowBridge,
+        hostPlatform: st.telemetry?.hostPlatform,
       }),
-      () => syncStepsBadge()
+      () => {
+        syncStepsBadge();
+        syncGlobalBridgeBanner();
+      }
     );
 
     const unsubScopeBadge = uiStore.subscribe(
@@ -102,10 +152,21 @@ export const App = defineComponent({
       () => syncStepsBadge()
     );
 
+    const unsubI18n = i18nStore.subscribe(
+      (st) => st.locale,
+      () => {
+        syncStepsBadge();
+        globalBridgeNotice.refs.refreshLabels();
+        patchAttr(bannerSlotEl, 'hidden', globalBridgeNotice.el.hasAttribute('hidden'));
+      }
+    );
+
     onCleanup(() => {
       unsubUi();
       unsubStepCount();
       unsubScopeBadge();
+      unsubI18n();
+      globalBridgeNotice.destroy();
       sessionHeader.destroy();
       topPillNav.destroy();
       overviewView.destroy();
@@ -119,6 +180,7 @@ export const App = defineComponent({
       refs: {
         sessionHeader,
         topPillNav,
+        globalBridgeNotice,
         overviewView,
         consumptionView,
         stepsView,

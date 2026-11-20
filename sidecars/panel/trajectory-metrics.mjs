@@ -18,6 +18,10 @@ export const MIN_SPEED_DURATION_SECONDS = 0.5;
 /** 纳入平均吞吐率（Mean TPS）统计的最小输出 Token 数阈值（50 Tokens），避免短回复被首字延迟主导 */
 export const MIN_MEAN_OUTPUT_TOKENS = 50;
 
+/** 纳入纯解码速度（Decode TPS）估算的最小净解码耗时（秒）与最小输出 Token 数，跳过短缓冲工具调用假峰值 */
+const MIN_DECODE_DURATION_SECONDS = 1.0;
+const MIN_DECODE_OUTPUT_TOKENS = 30;
+
 /**
  * 解析 ISO-8601 时间戳字符串为亚毫秒精度的浮点毫秒时间戳。
  * 标准 `Date.parse` 仅保留到整数毫秒，本函数额外提取小数部分以保留亚毫秒精度。
@@ -169,15 +173,29 @@ function estimateUtf8Tokens(text) {
  * @param {unknown} name 分块名称或标题
  * @returns {'skills' | 'userRules' | 'mcpTools' | 'systemPrompt'} 归属的上下文分类键名
  */
-function classifyPromptSection(name) {
-  const key = String(name || '').trim().toLowerCase();
+function classifyPromptSection(name, type = '') {
+  const key = String(name || type || '')
+    .trim()
+    .toLowerCase()
+    .replace(/^token_type_/, '')
+    .replace(/[\s-]+/g, '_');
   if (key === 'skills' || key === 'skill') {
     return 'skills';
   }
-  if (key === 'user_rules' || key === 'user_rule' || key === 'rules') {
+  if (
+    key === 'user_rules' ||
+    key === 'user_rule' ||
+    key === 'rules' ||
+    key === 'rule'
+  ) {
     return 'userRules';
   }
-  if (key === 'mcp_servers' || key === 'mcp' || key.startsWith('mcp_')) {
+  if (
+    key === 'mcp_servers' ||
+    key === 'mcp_tools' ||
+    key === 'mcp' ||
+    key.startsWith('mcp_')
+  ) {
     return 'mcpTools';
   }
   return 'systemPrompt';
@@ -328,7 +346,7 @@ export function extractContextBreakdown(chat) {
         for (const c of children) {
           const tok = Math.max(0, Number(c?.numTokens || 0));
           childSum += tok;
-          const bucket = classifyPromptSection(c?.name ?? c?.title);
+          const bucket = classifyPromptSection(c?.name ?? c?.title, c?.type);
           if (bucket === 'skills') {
             skillsTokens += tok;
           } else if (bucket === 'userRules') {
@@ -345,6 +363,32 @@ export function extractContextBreakdown(chat) {
       } else {
         systemPromptTokens += gTokens;
       }
+    } else if (
+      gType === 'TOKEN_TYPE_SKILLS' ||
+      gName === 'skills' ||
+      gName === 'skill'
+    ) {
+      hasPromptGroup = true;
+      skillsTokens += gTokens;
+    } else if (
+      gType === 'TOKEN_TYPE_RULES' ||
+      gType === 'TOKEN_TYPE_USER_RULES' ||
+      gName === 'rules' ||
+      gName === 'user rules' ||
+      gName === 'user_rules'
+    ) {
+      hasPromptGroup = true;
+      userRulesTokens += gTokens;
+    } else if (
+      gType === 'TOKEN_TYPE_SUBAGENTS' ||
+      gType === 'TOKEN_TYPE_PLUGINS' ||
+      gName === 'subagents' ||
+      gName === 'plugins' ||
+      gName === 'featured plugins' ||
+      gName === 'featured_plugins'
+    ) {
+      hasPromptGroup = true;
+      systemPromptTokens += gTokens;
     } else if (
       gType === 'TOKEN_TYPE_TOOLS' ||
       gName === 'tools' ||
@@ -451,6 +495,19 @@ export function extractContextBreakdown(chat) {
       } else if (gTokens > 0) {
         userInputTokens += gTokens;
       }
+    } else if (gTokens > 0) {
+      // 兜底接收未来新增的顶层提示词分组，确保 tokenBreakdown.groups 不丢任何分组
+      hasPromptGroup = true;
+      const fallbackBucket = classifyPromptSection(g?.name, g?.type);
+      if (fallbackBucket === 'skills') {
+        skillsTokens += gTokens;
+      } else if (fallbackBucket === 'userRules') {
+        userRulesTokens += gTokens;
+      } else if (fallbackBucket === 'mcpTools') {
+        mcpToolsTokens += gTokens;
+      } else {
+        systemPromptTokens += gTokens;
+      }
     }
   }
 
@@ -544,6 +601,260 @@ export function extractContextBreakdown(chat) {
   };
 }
 
+const ANOMALY_SEVERITY_PRIORITY = Object.freeze({
+  rate_limit: 9,
+  auth_or_model: 8,
+  timeout: 7,
+  capacity: 6,
+  disconnect: 5,
+  upstream: 4,
+  model_output: 3,
+  safety: 2,
+  error: 1,
+  canceled: 0,
+});
+
+/**
+ * 将模型调用重试、超时或错误文本归类为标准化异常类型。
+ *
+ * @param {string} [rawError='']
+ * @param {{ reasonCode?: number, errorCode?: number, isCanceled?: boolean }} [opts]
+ * @returns {'timeout'|'rate_limit'|'capacity'|'disconnect'|'upstream'|'model_output'|'safety'|'auth_or_model'|'canceled'|'error'}
+ */
+export function classifyStepAnomalyError(
+  rawError = '',
+  { reasonCode = 0, errorCode = 0, isCanceled = false } = {}
+) {
+  const s = String(rawError || '').trim();
+  if (isCanceled || /context canceled by user|stream reading error:\s*context canceled/i.test(s)) {
+    return 'canceled';
+  }
+  if (reasonCode === 2 || /model output error|model produced invalid output|invalid tool call/i.test(s)) {
+    return 'model_output';
+  }
+  if (
+    errorCode === 429 ||
+    /\b429\b|RESOURCE_EXHAUSTED|quota reached|rate.?limit/i.test(s)
+  ) {
+    return 'rate_limit';
+  }
+  if (
+    /stream idle timeout|TLS handshake timeout|i\/o timeout|context deadline exceeded|\btimeout\b/i.test(
+      s
+    )
+  ) {
+    return 'timeout';
+  }
+  if (
+    errorCode === 503 ||
+    /\b503\b|UNAVAILABLE|No capacity available|overloaded|high demand/i.test(s)
+  ) {
+    return 'capacity';
+  }
+  if (
+    /wsarecv|wsasend|forcibly closed|connection reset|broken pipe|ECONNRESET|unexpected EOF|:\s*EOF\b|The stream was interrupted|no such host|dial tcp|tls:|bad record MAC/i.test(
+      s
+    )
+  ) {
+    return 'disconnect';
+  }
+  if (/safety filter|content safety|sensitive words/i.test(s)) {
+    return 'safety';
+  }
+  if (
+    errorCode === 500 ||
+    errorCode === 502 ||
+    errorCode === 504 ||
+    /\b(?:500|502|504)\b|\bINTERNAL\b|BAD_GATEWAY/i.test(s)
+  ) {
+    return 'upstream';
+  }
+  if (
+    errorCode === 400 ||
+    errorCode === 401 ||
+    errorCode === 403 ||
+    errorCode === 404 ||
+    /\b(?:400|401|403|404)\b|PERMISSION_DENIED|UNAUTHENTICATED|FAILED_PRECONDITION|NOT_FOUND|unknown model|unsupported mime/i.test(
+      s
+    )
+  ) {
+    return 'auth_or_model';
+  }
+  return 'error';
+}
+
+function cleanAnomalyErrorExcerpt(rawText) {
+  let s = String(rawText || '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!s) return '';
+  s = s.replace(/^API error \(attempt \d+\):\s*/i, '');
+  s = s.replace(/^agent executor error:\s*generating and executing:\s*/i, '');
+  s = s.replace(/^request failed:\s*/i, '');
+  return s.length > 180 ? `${s.slice(0, 179)}…` : s;
+}
+
+function extractErrorStepPayload(step) {
+  if (!step || typeof step !== 'object') return null;
+  const em = step.errorMessage;
+  const errObj = em?.error && typeof em.error === 'object' ? em.error : em;
+  const shortErr = String(
+    errObj?.shortError ||
+      errObj?.message ||
+      step.error ||
+      ''
+  ).trim();
+  const userMsg = String(errObj?.userErrorMessage || '').trim();
+  const fallbackContent =
+    !shortErr && !userMsg && typeof step.content === 'string'
+      ? step.content.replace(/^Error:\s*/i, '').trim()
+      : '';
+  const message = shortErr || userMsg || fallbackContent;
+  if (!message) return null;
+  const errorCode = Number(errObj?.errorCode || 0) || 0;
+  const terminal = Boolean(em?.shouldShowUser);
+  return { message, userMsg, errorCode, terminal };
+}
+
+function buildStepAnomalyRecord(step, meta, chat, pendingErrorSteps = []) {
+  const retryInfosRaw = [
+    ...(Array.isArray(chat?.retryInfos) ? chat.retryInfos : []),
+    ...(Array.isArray(meta?.retryInfos) ? meta.retryInfos : []),
+  ];
+  const retryErrorEntries = [];
+  for (let i = 0; i < retryInfosRaw.length; i += 1) {
+    const ri = retryInfosRaw[i];
+    if (!ri || typeof ri !== 'object') continue;
+    const errText = String(ri.error || ri.errorMessage || '').trim();
+    const reasonCode = Number(ri.reasonCode || 0) || 0;
+    const delaySec = duration(ri.retryDelay);
+    if (!errText && !(reasonCode > 0 && reasonCode !== 3)) continue;
+    const kind = classifyStepAnomalyError(errText, { reasonCode });
+    // 纯用户取消且无其他重试时不重复打告警微标（速度列已有「已取消」）
+    if (kind === 'canceled') continue;
+    retryErrorEntries.push({
+      attempt: retryErrorEntries.length + 1,
+      kind,
+      delaySec: delaySec != null && delaySec > 0 ? +delaySec.toFixed(1) : 0,
+      message: cleanAnomalyErrorExcerpt(errText),
+      terminal: reasonCode === 3,
+      source: 'retry',
+    });
+  }
+
+  const events = [...retryErrorEntries];
+  const declaredRetryCount = Math.max(0, Math.floor(Number(chat?.retryCount || 0)));
+
+  // 合并同一轮前置 ERROR_MESSAGE 步骤（对已被 retryInfos 记录的同源重试做去重，保留断流续跑/安全过滤/离线日志补充）
+  const usedRetryKinds = new Map();
+  for (const ev of retryErrorEntries) {
+    usedRetryKinds.set(ev.kind, (usedRetryKinds.get(ev.kind) || 0) + 1);
+  }
+  const matchedKindBudget = new Map(usedRetryKinds);
+
+  for (const errStep of pendingErrorSteps || []) {
+    const info = extractErrorStepPayload(errStep);
+    if (!info) continue;
+    const kind = classifyStepAnomalyError(info.message, { errorCode: info.errorCode });
+    if (kind === 'canceled') continue;
+    const isInterruptOrSafety =
+      kind === 'safety' ||
+      /The stream was interrupted/i.test(info.message) ||
+      info.terminal;
+    if (!isInterruptOrSafety) {
+      const rem = matchedKindBudget.get(kind) || 0;
+      if (rem > 0) {
+        matchedKindBudget.set(kind, rem - 1);
+        continue;
+      }
+    }
+    events.push({
+      attempt: events.length + 1,
+      kind,
+      delaySec: 0,
+      message: cleanAnomalyErrorExcerpt(info.message),
+      terminal: Boolean(info.terminal),
+      source: 'error_step',
+    });
+  }
+
+  const isStatusError = step?.status === 'CORTEX_STEP_STATUS_ERROR';
+  const isStatusInterrupted = step?.status === 'CORTEX_STEP_STATUS_INTERRUPTED';
+  if (events.length === 0 && (isStatusError || isStatusInterrupted)) {
+    events.push({
+      attempt: 1,
+      kind: isStatusInterrupted ? 'disconnect' : 'error',
+      delaySec: 0,
+      message: '',
+      terminal: isStatusError,
+      source: 'status',
+    });
+  }
+
+  const count = Math.max(events.length, declaredRetryCount);
+  if (count <= 0) return null;
+
+  if (events.length === 0 && declaredRetryCount > 0) {
+    events.push({
+      attempt: 1,
+      kind: 'error',
+      delaySec: 0,
+      message: '',
+      terminal: false,
+      source: 'retry_count',
+    });
+  }
+
+  const kinds = {};
+  let totalDelaySec = 0;
+  let hasDanger = isStatusError;
+  for (const ev of events) {
+    kinds[ev.kind] = (kinds[ev.kind] || 0) + 1;
+    if (ev.delaySec > 0) totalDelaySec += ev.delaySec;
+    if (ev.terminal || ev.kind === 'rate_limit' || ev.kind === 'auth_or_model') {
+      hasDanger = true;
+    }
+  }
+  // 归并主分类：按出现次数降序，同次数按严重度优先级决胜
+  let primaryKind = events[0].kind;
+  let bestCount = -1;
+  let bestPrio = -1;
+  for (const [k, c] of Object.entries(kinds)) {
+    const prio = ANOMALY_SEVERITY_PRIORITY[k] ?? 1;
+    if (c > bestCount || (c === bestCount && prio > bestPrio)) {
+      primaryKind = k;
+      bestCount = c;
+      bestPrio = prio;
+    }
+  }
+
+  const roundedDelay = totalDelaySec > 0 ? +totalDelaySec.toFixed(1) : 0;
+  const severity = hasDanger ? 'danger' : 'warn';
+  const compactEvents = events.slice(0, 6).map((ev, idx) => ({
+    attempt: idx + 1,
+    kind: ev.kind,
+    ...(ev.delaySec > 0 ? { delaySec: ev.delaySec } : {}),
+    ...(ev.message ? { message: ev.message } : {}),
+    ...(ev.terminal ? { terminal: true } : {}),
+  }));
+  const kindSig = Object.entries(kinds)
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .map(([k, v]) => `${k}=${v}`)
+    .join(',');
+  const sig = `${primaryKind}:${count}:${severity}:${roundedDelay}:${kindSig}`;
+  return {
+    anomaly: {
+      count,
+      primaryKind,
+      severity,
+      totalDelaySec: roundedDelay,
+      kinds,
+      events: compactEvents,
+    },
+    anomalySig: sig,
+  };
+}
+
 /**
  * 从原始轨迹步骤数组与生成器元数据中提取标准化模型步骤指标。
  *
@@ -555,8 +866,9 @@ export function extractContextBreakdown(chat) {
  *    - 优先级 3：`chat.model`（`chatModel` 请求级模型标识）
  *    - 优先级 4：`metadata.generatorModel`（步骤 `metadata` 顶层记录的生成模型）
  *    - 优先级 5：`chat.responseModel`（上游返回的具体响应模型名）
- * 2. **5 种测速过滤与排除原因（`timingReason` / `speedReason`）**：
- *    - `'incomplete_or_invalid_timing'`：步骤状态未完成（非 `CORTEX_STEP_STATUS_DONE`）或总耗时 `totalDurationSec` 缺失/非正数；
+ * 2. **测速过滤与排除原因（`timingReason` / `speedReason`）**：
+ *    - `'canceled'`：生成已取消，保留用量但不参与测速；
+ *    - `'incomplete_or_invalid_timing'`：没有完成生成的证据，或总耗时 `totalDurationSec` 缺失/非正数；
  *    - `'invalid_output_tokens'`：`outputTokens` 不是合法的非负安全整数；
  *    - `'short_timing'`：请求总耗时低于 `MIN_SPEED_DURATION_SECONDS`（0.5s），易受计时器粒度噪声干扰；
  *    - `'inconsistent_timing'`：原生首字延迟 `nativeTtftSec` 大于请求总耗时 `totalDurationSec + 0.01s`（时钟或元数据自相矛盾）；
@@ -610,12 +922,287 @@ export function extractModelSteps(rawSteps = [], generatorMetadata = []) {
 
   const result = [];
   let lastCompactionStepIdx = -1;
+  let turnCounter = 0;
+  let activeTurnIndex = null;
+  let pendingTurnPrompts = [];
+  let pendingTurnHasMedia = false;
+  let hasUnconsumedTurn = false;
+
+  const isUserTurnBoundary = (step) => {
+    if (!step || typeof step !== 'object') return false;
+    const t = String(step.type || '').trim().toUpperCase();
+    if (t === 'CORTEX_STEP_TYPE_USER_INPUT' || t === 'USER_INPUT') {
+      return true;
+    }
+    return Boolean(step.userInput && typeof step.userInput === 'object');
+  };
+
+  const hasHumanUserTurn = rawSteps.some(isUserTurnBoundary);
+
+  const isSystemWakeupBoundary = (step) => {
+    if (hasHumanUserTurn || !step || typeof step !== 'object') return false;
+    if (isCheckpointStep(step)) return false;
+    const t = String(step.type || '').trim().toUpperCase();
+    if (t !== 'CORTEX_STEP_TYPE_SYSTEM_MESSAGE' && t !== 'SYSTEM_MESSAGE') {
+      return false;
+    }
+    const rawMsg = String(step?.systemMessage?.message || step?.content || '').trim();
+    const withoutSummary = rawMsg
+      .replace(/<CONTEXT_SUMMARY>[\s\S]*?<\/CONTEXT_SUMMARY>/gi, '')
+      .trim();
+    if (!withoutSummary || /BROWSER_HOST_FACTS/i.test(withoutSummary)) return false;
+    return true;
+  };
+
+  const extractSystemWakeupInfo = (step) => {
+    let raw = String(step?.systemMessage?.message || step?.content || '').trim();
+    const sysMatches = [...raw.matchAll(/<SYSTEM_MESSAGE>([\s\S]*?)<\/SYSTEM_MESSAGE>/gi)];
+    if (sysMatches.length > 0) {
+      raw = sysMatches[sysMatches.length - 1][1].trim();
+    } else {
+      raw = raw.replace(/^The following is a <SYSTEM_MESSAGE>[\s\S]*?<SYSTEM_MESSAGE>/i, '').replace(/<\/SYSTEM_MESSAGE>\s*$/i, '').trim();
+    }
+    raw = raw.replace(/^\[Message\]\s+timestamp=\S+\s+sender=\S+\s+priority=\S+\s+content=/i, '').trim();
+
+    const doorbellMatch = raw.match(/^\[swarm\]\s+new board message\s+#(\d+)\s*$/i);
+    if (doorbellMatch) {
+      const tag = `[swarm] #${doorbellMatch[1]}`;
+      return { cleanText: tag, legacyPrompt: tag, hasMedia: false, isDoorbellOnly: true };
+    }
+
+    const assignMatch = raw.match(
+      /^You have just started\.\s*Your assignment\s*\(recorded on the board as #(\d+)\s+for\s+@?([^\s):]+)\)\s*:\s*([\s\S]*)$/i
+    );
+    if (assignMatch) {
+      const seq = assignMatch[1];
+      const member = assignMatch[2];
+      const bodyLines = String(assignMatch[3] || '')
+        .split(/\r?\n/)
+        .map((l) => l.replace(/\s+/g, ' ').trim())
+        .filter(Boolean);
+      const bodyPreview = bodyLines.join(' ');
+      const full = bodyPreview ? `#${seq} @${member} · ${bodyPreview}` : `#${seq} @${member}`;
+      const cleanText = full.length > 180 ? `${full.slice(0, 179)}…` : full;
+      return { cleanText, legacyPrompt: cleanText, hasMedia: false, isDoorbellOnly: false };
+    }
+
+    const boardDeltaMatch = raw.match(
+      /^\[board\]\s+the latest message is #(\d+)\s*\(you have read up to #(\d+)\)/i
+    );
+    if (boardDeltaMatch) {
+      const tag = `[board] #${boardDeltaMatch[2]} -> #${boardDeltaMatch[1]}`;
+      return { cleanText: tag, legacyPrompt: tag, hasMedia: false, isDoorbellOnly: true };
+    }
+
+    const monitorTickMatch = raw.match(/^\[monitor\]\s+tick:[^(]*\(iteration\s+(\d+)\)\s*$/i);
+    if (monitorTickMatch) {
+      const tag = `[monitor] tick #${monitorTickMatch[1]}`;
+      return { cleanText: tag, legacyPrompt: tag, hasMedia: false, isDoorbellOnly: false };
+    }
+
+    const cleaned = raw
+      .split(/\r?\n/)
+      .map((l) => l.replace(/\s+/g, ' ').trim())
+      .filter(Boolean)
+      .join('\n');
+    const cleanText = cleaned.length > 180 ? `${cleaned.slice(0, 179)}…` : cleaned;
+    return { cleanText, legacyPrompt: cleanText, hasMedia: false, isDoorbellOnly: false };
+  };
+
+  const extractUserTurnInfo = (step) => {
+    const ui = step?.userInput;
+    let raw = '';
+    if (typeof ui?.userResponse === 'string' && ui.userResponse.trim()) {
+      raw = ui.userResponse;
+    } else if (Array.isArray(ui?.items)) {
+      raw = ui.items
+        .map((it) => (typeof it?.text === 'string' ? it.text : ''))
+        .filter(Boolean)
+        .join('\n');
+    } else if (typeof step?.content === 'string' && step.content.trim()) {
+      const withoutSummary = step.content
+        .replace(/<CONTEXT_SUMMARY>[\s\S]*?<\/CONTEXT_SUMMARY>/gi, '')
+        .replace(/<SYSTEM_MESSAGE>[\s\S]*$/i, '');
+      const reqMatches = [...withoutSummary.matchAll(/<USER_REQUEST>([\s\S]*?)<\/USER_REQUEST>/gi)];
+      raw =
+        reqMatches.length > 0
+          ? reqMatches[reqMatches.length - 1][1]
+          : withoutSummary.replace(/<ADDITIONAL_METADATA>[\s\S]*$/i, '');
+    }
+    const cleaned = String(raw || '')
+      .split(/\r?\n/)
+      .map((l) => l.replace(/\s+/g, ' ').trim())
+      .filter(Boolean)
+      .join('\n');
+    const mediaArr = Array.isArray(ui?.media)
+      ? ui.media
+      : Array.isArray(step?.media)
+        ? step.media
+        : [];
+    const hasMedia = mediaArr.length > 0;
+    const cleanText = cleaned.length > 180 ? `${cleaned.slice(0, 179)}…` : cleaned;
+    const legacyRaw = !cleaned ? (hasMedia ? '[图片/附件提问]' : '') : hasMedia ? `${cleaned} [附图]` : cleaned;
+    const legacyPrompt = legacyRaw.length > 180 ? `${legacyRaw.slice(0, 179)}…` : legacyRaw;
+    return { cleanText, legacyPrompt, hasMedia };
+  };
+
+  let pendingTurnCleanPrompts = [];
+  let pendingTurnDoorbellOnly = false;
+  let pendingErrorSteps = [];
+
+  const isErrorMessageStep = (step) => {
+    if (!step || typeof step !== 'object') return false;
+    const t = String(step.type || '').trim().toUpperCase();
+    return (
+      t === 'CORTEX_STEP_TYPE_ERROR_MESSAGE' ||
+      t === 'ERROR_MESSAGE' ||
+      Boolean(step.errorMessage && typeof step.errorMessage === 'object')
+    );
+  };
+
+  const mergeTrailingErrorsIntoStep = (targetStep, errSteps) => {
+    if (!targetStep || !Array.isArray(errSteps) || errSteps.length === 0) return;
+    const prevEvents = Array.isArray(targetStep.anomaly?.events) ? targetStep.anomaly.events : [];
+    const trailingRec = buildStepAnomalyRecord(null, null, null, errSteps);
+    if (!trailingRec) return;
+    const isStatusOnlyPlaceholder =
+      prevEvents.length === 1 &&
+      Number(targetStep.anomaly?.count || 0) === 1 &&
+      !prevEvents[0].message &&
+      !(Number(prevEvents[0].delaySec) > 0) &&
+      (prevEvents[0].kind === 'error' || prevEvents[0].kind === 'disconnect');
+    if (prevEvents.length === 0 || isStatusOnlyPlaceholder) {
+      const nextAnomaly =
+        isStatusOnlyPlaceholder &&
+        targetStep.anomaly?.severity === 'danger' &&
+        trailingRec.anomaly.severity !== 'danger'
+          ? { ...trailingRec.anomaly, severity: 'danger' }
+          : trailingRec.anomaly;
+      targetStep.anomaly = nextAnomaly;
+      targetStep.anomalySig =
+        nextAnomaly === trailingRec.anomaly
+          ? trailingRec.anomalySig
+          : trailingRec.anomalySig.replace(':warn:', ':danger:');
+      return;
+    }
+    const mergedKinds = { ...(targetStep.anomaly.kinds || {}) };
+    for (const [k, c] of Object.entries(trailingRec.anomaly.kinds || {})) {
+      mergedKinds[k] = (mergedKinds[k] || 0) + c;
+    }
+    const mergedCount = Number(targetStep.anomaly.count || 0) + Number(trailingRec.anomaly.count || 0);
+    const mergedDelay = +(
+      Number(targetStep.anomaly.totalDelaySec || 0) + Number(trailingRec.anomaly.totalDelaySec || 0)
+    ).toFixed(1);
+    const mergedSeverity =
+      targetStep.anomaly.severity === 'danger' || trailingRec.anomaly.severity === 'danger'
+        ? 'danger'
+        : 'warn';
+    let primaryKind = targetStep.anomaly.primaryKind || trailingRec.anomaly.primaryKind;
+    let bestCount = -1;
+    let bestPrio = -1;
+    for (const [k, c] of Object.entries(mergedKinds)) {
+      const prio = ANOMALY_SEVERITY_PRIORITY[k] ?? 1;
+      if (c > bestCount || (c === bestCount && prio > bestPrio)) {
+        primaryKind = k;
+        bestCount = c;
+        bestPrio = prio;
+      }
+    }
+    const combinedEvents = [...prevEvents, ...(trailingRec.anomaly.events || [])]
+      .slice(0, 6)
+      .map((ev, i) => ({ ...ev, attempt: i + 1 }));
+    const kindSig = Object.entries(mergedKinds)
+      .sort((a, b) => a[0].localeCompare(b[0]))
+      .map(([k, v]) => `${k}=${v}`)
+      .join(',');
+    targetStep.anomaly = {
+      count: mergedCount,
+      primaryKind,
+      severity: mergedSeverity,
+      totalDelaySec: mergedDelay,
+      kinds: mergedKinds,
+      events: combinedEvents,
+    };
+    targetStep.anomalySig = `${primaryKind}:${mergedCount}:${mergedSeverity}:${mergedDelay}:${kindSig}`;
+  };
 
   rawSteps.forEach((s, index) => {
+    const isHumanBoundary = isUserTurnBoundary(s);
+    const isWakeupBoundary = !isHumanBoundary && isSystemWakeupBoundary(s);
+    if (isHumanBoundary || isWakeupBoundary) {
+      if (pendingErrorSteps.length > 0 && result.length > 0) {
+        const lastPrev = result[result.length - 1];
+        if (lastPrev.turnIndex === activeTurnIndex) {
+          mergeTrailingErrorsIntoStep(lastPrev, pendingErrorSteps);
+        }
+      }
+      pendingErrorSteps = [];
+      const { cleanText, legacyPrompt, hasMedia, isDoorbellOnly = false } = isHumanBoundary
+        ? extractUserTurnInfo(s)
+        : extractSystemWakeupInfo(s);
+      if (!hasUnconsumedTurn) {
+        hasUnconsumedTurn = true;
+        pendingTurnPrompts = legacyPrompt ? [legacyPrompt] : [];
+        pendingTurnCleanPrompts = cleanText ? [cleanText] : [];
+        pendingTurnHasMedia = hasMedia;
+        pendingTurnDoorbellOnly = Boolean(isWakeupBoundary && isDoorbellOnly);
+      } else if (isWakeupBoundary && pendingTurnDoorbellOnly && !isDoorbellOnly && cleanText) {
+        // 合并连续唤醒步时，用紧随其后的真实简报/任务正文覆盖前置的纯 #seq 门铃提示
+        pendingTurnPrompts = legacyPrompt ? [legacyPrompt] : [];
+        pendingTurnCleanPrompts = [cleanText];
+        pendingTurnDoorbellOnly = false;
+      } else if (!(isWakeupBoundary && isDoorbellOnly && !pendingTurnDoorbellOnly)) {
+        if (
+          legacyPrompt &&
+          pendingTurnPrompts[pendingTurnPrompts.length - 1] !== legacyPrompt
+        ) {
+          pendingTurnPrompts.push(legacyPrompt);
+        }
+        if (
+          cleanText &&
+          pendingTurnCleanPrompts[pendingTurnCleanPrompts.length - 1] !== cleanText
+        ) {
+          pendingTurnCleanPrompts.push(cleanText);
+        }
+        if (hasMedia) pendingTurnHasMedia = true;
+      }
+    }
+
+    if (isErrorMessageStep(s)) {
+      pendingErrorSteps.push(s);
+      return;
+    }
+
     const m = s?.metadata;
     const u = m?.modelUsage || m?.retryInfos?.[0]?.usage;
     if (!u) {
       return;
+    }
+    const stepPendingErrors = pendingErrorSteps;
+    pendingErrorSteps = [];
+
+    let stepIsTurnStart = false;
+    let stepTurnPrompt = '';
+    let stepTurnPromptClean = '';
+    let stepTurnHasMedia = false;
+    let stepTurnMediaOnly = false;
+    if (hasUnconsumedTurn) {
+      turnCounter += 1;
+      activeTurnIndex = turnCounter;
+      stepIsTurnStart = true;
+      const joinedPrompt = pendingTurnPrompts.join('\n').trim();
+      const joinedClean = pendingTurnCleanPrompts.join('\n').trim();
+      stepTurnPrompt =
+        joinedPrompt.length > 180 ? `${joinedPrompt.slice(0, 179)}…` : joinedPrompt;
+      stepTurnPromptClean =
+        joinedClean.length > 180 ? `${joinedClean.slice(0, 179)}…` : joinedClean;
+      stepTurnHasMedia = pendingTurnHasMedia;
+      stepTurnMediaOnly = Boolean(pendingTurnHasMedia && !stepTurnPromptClean);
+      hasUnconsumedTurn = false;
+      pendingTurnPrompts = [];
+      pendingTurnCleanPrompts = [];
+      pendingTurnHasMedia = false;
+      pendingTurnDoorbellOnly = false;
     }
 
     const stepIndex = m.sourceTrajectoryStepInfo?.stepIndex ?? index;
@@ -658,12 +1245,14 @@ export function extractModelSteps(rawSteps = [], generatorMetadata = []) {
         : Math.max(0, outputTokens - thinkingTokens);
 
     const start = parseIsoMs(m.createdAt);
+    // 轨迹清理可把已生成的步骤改为 CLEARED；仍需原始生成结束时间，避免将清理时间计入测速。
+    const isCleared = s.status === 'CORTEX_STEP_STATUS_CLEARED';
     const measuredDuration = requestDuration(
       m.createdAt,
-      m.finishedGeneratingAt || m.completedAt
+      m.finishedGeneratingAt || (isCleared ? null : m.completedAt)
     );
     const explicitlyIncomplete = Boolean(
-      s.status && s.status !== 'CORTEX_STEP_STATUS_DONE'
+      s.status && s.status !== 'CORTEX_STEP_STATUS_DONE' && !isCleared
     );
     const complete = !explicitlyIncomplete && measuredDuration !== null;
     const totalDurationSec = complete ? measuredDuration : null;
@@ -674,9 +1263,15 @@ export function extractModelSteps(rawSteps = [], generatorMetadata = []) {
     const nativeStreamSec = duration(chat?.streamingDuration);
     const thinkingDurationSec = duration(p.thinkingDuration);
 
-    // 5 种测速过滤原因判定：先校验耗时与 Token 合法性（timingReason），再判定压缩步与短样本（speedReason）
+    // 先校验状态、耗时与 Token 合法性，再判定压缩步与短样本。
     let timingReason = null;
-    if (!complete || !(totalDurationSec > 0)) {
+    if (s.status === 'CORTEX_STEP_STATUS_CANCELED') {
+      timingReason = 'canceled';
+    } else if (s.status === 'CORTEX_STEP_STATUS_ERROR') {
+      timingReason = 'error';
+    } else if (s.status === 'CORTEX_STEP_STATUS_INTERRUPTED') {
+      timingReason = 'interrupted';
+    } else if (!complete || !(totalDurationSec > 0)) {
       timingReason = 'incomplete_or_invalid_timing';
     } else if (!validCount(u.outputTokens)) {
       timingReason = 'invalid_output_tokens';
@@ -740,6 +1335,8 @@ export function extractModelSteps(rawSteps = [], generatorMetadata = []) {
         ? 'Orchestrator Worker (Hydrogen)'
         : rawDisplayName;
 
+    const anomalyRec = buildStepAnomalyRecord(s, m, chat, stepPendingErrors);
+
     result.push({
       stepIndex,
       isCompactionStep,
@@ -763,6 +1360,7 @@ export function extractModelSteps(rawSteps = [], generatorMetadata = []) {
         context?.estimatedTokensUsed || contextBreakdown?.totalTokens || 0
       ),
       maxContextBudgetTokens: Number(context?.maxContextTokens || 256000),
+      ...(context?.maxContextTokens > 0 ? { reportedContextLimitTokens: Number(context.maxContextTokens) } : {}),
       contextBreakdown,
       measurementVersion: MEASUREMENT_VERSION,
       isComplete: complete,
@@ -778,8 +1376,21 @@ export function extractModelSteps(rawSteps = [], generatorMetadata = []) {
       speedSampleEligible:
         totalTokPerSec !== null && !shortOutputSample && !isCompactionStep,
       speedReason,
+      ...(anomalyRec ? { anomaly: anomalyRec.anomaly, anomalySig: anomalyRec.anomalySig } : {}),
+      turnIndex: activeTurnIndex,
+      isTurnStart: stepIsTurnStart,
+      ...(stepIsTurnStart && stepTurnPrompt ? { turnPrompt: stepTurnPrompt } : {}),
+      ...(stepIsTurnStart && stepTurnPromptClean ? { turnPromptClean: stepTurnPromptClean } : {}),
+      ...(stepIsTurnStart ? { turnHasMedia: stepTurnHasMedia, turnMediaOnly: stepTurnMediaOnly } : {}),
     });
   });
+
+  if (pendingErrorSteps.length > 0 && result.length > 0) {
+    const lastStep = result[result.length - 1];
+    if (lastStep.turnIndex === activeTurnIndex) {
+      mergeTrailingErrorsIntoStep(lastStep, pendingErrorSteps);
+    }
+  }
 
   // 末尾步骤上下文回填：若最后一个非压缩步骤缺少 contextBreakdown，且最近一次有效的 generatorMetadata 未跨过压缩边界，则补齐
   if (
@@ -907,12 +1518,17 @@ export function inferCompactionStepModels(steps) {
       step.responseModel || (donorSameModel ? donor.responseModel || '' : '');
     const nextDisplayName =
       step.modelDisplayName || (donorSameModel ? donor.modelDisplayName || '' : '');
+    const nextMaxBudget =
+      !step.reportedContextLimitTokens && donor.maxContextBudgetTokens > 0
+        ? donor.maxContextBudgetTokens
+        : step.maxContextBudgetTokens;
 
     if (
       nextModelKey === step.modelKey &&
       nextModelSource === step.modelSource &&
       nextResponseModel === (step.responseModel || '') &&
-      nextDisplayName === (step.modelDisplayName || '')
+      nextDisplayName === (step.modelDisplayName || '') &&
+      nextMaxBudget === step.maxContextBudgetTokens
     ) {
       return step;
     }
@@ -923,6 +1539,7 @@ export function inferCompactionStepModels(steps) {
       modelSource: nextModelSource,
       responseModel: nextResponseModel,
       modelDisplayName: nextDisplayName,
+      maxContextBudgetTokens: nextMaxBudget,
     };
   });
 }
@@ -1051,7 +1668,10 @@ export function speedMetric(step) {
     !Number.isFinite(step.totalTokPerSec) ||
     !(step.totalDurationSec >= MIN_SPEED_DURATION_SECONDS)
   ) {
-    return missing(step.speedReason || 'incomplete_or_invalid_timing');
+    const reason = step.speedReason || 'incomplete_or_invalid_timing';
+    return missing(step.isCompactionStep && reason === 'incomplete_or_invalid_timing'
+      ? 'compaction_timing_unavailable'
+      : reason);
   }
 
   return {
@@ -1063,15 +1683,8 @@ export function speedMetric(step) {
   };
 }
 
-/** 计算单步扣除首字延迟（TTFT）后的纯解码输出速率最小净耗时（1.0 秒），过滤缓冲式工具调用造成的短分母假峰值 */
-const MIN_DECODE_DURATION_SECONDS = 1.0;
-
-/** 计算单步纯解码输出速率的最小有效输出 Token 数阈值 */
-const MIN_DECODE_OUTPUT_TOKENS = 30;
-
 /**
- * 计算单个已完成步骤扣除首字延迟（TTFT）后的纯解码吐字速率（Decode TPS）。
- * 仅作输入框下方实时速率展示的结算参考，不影响原有端到端 `totalTokPerSec` 与会话均值口径。
+ * 计算单步扣除原生首字延迟（`nativeTtftSec`）后的纯解码吐字速率（Decode TPS），用于主聊天输入框下方实时速率展示。
  *
  * 物理对齐规则：
  * - 若思考阶段在 `nativeTtftSec` 之后继续流式输出（`thinkingDurationSec > nativeTtftSec`），分母覆盖思考与回复，分子取 `outputTokens`；
@@ -1312,10 +1925,12 @@ export function summarizeTtft(steps) {
 /** 标志着原始轨迹步骤已进入终态的状态枚举集合（兼容 Connect RPC 与 transcript.jsonl） */
 const LIVE_TERMINAL_STATUSES = new Set([
   'CORTEX_STEP_STATUS_DONE',
+  'CORTEX_STEP_STATUS_CLEARED',
   'CORTEX_STEP_STATUS_ERROR',
   'CORTEX_STEP_STATUS_CANCELED',
   'CORTEX_STEP_STATUS_CANCELLED',
   'DONE',
+  'CLEARED',
   'ERROR',
   'CANCELED',
   'CANCELLED',
@@ -1598,7 +2213,11 @@ export function summarizeToolCall(rawToolCall, fallbackStep = null) {
       rawName = 'edit_file';
     } else if (stepType.includes('GREP_SEARCH') || fallbackStep?.grepSearch) {
       rawName = 'grep_search';
-    } else if (stepType.includes('FIND_BY_NAME') || fallbackStep?.findByName) {
+    } else if (
+      stepType.includes('FIND_BY_NAME') ||
+      stepType === 'CORTEX_STEP_TYPE_FIND' ||
+      fallbackStep?.findByName
+    ) {
       rawName = 'find_by_name';
     } else if (stepType.includes('SEARCH_WEB') || fallbackStep?.searchWeb) {
       rawName = 'search_web';
@@ -1675,6 +2294,7 @@ export function summarizeToolCall(rawToolCall, fallbackStep = null) {
         : summary || cmdSnippet || '';
     return {
       toolName: nameLower,
+      actionKey: 'run_command',
       isAskUser: false,
       label: '执行命令',
       detail,
@@ -1701,6 +2321,7 @@ export function summarizeToolCall(rawToolCall, fallbackStep = null) {
           : '';
     return {
       toolName: nameLower,
+      actionKey: 'read_file',
       isAskUser: false,
       label: '读取文件',
       detail: file ? `${file}${rangeSuffix}` : '',
@@ -1718,6 +2339,7 @@ export function summarizeToolCall(rawToolCall, fallbackStep = null) {
     );
     return {
       toolName: nameLower,
+      actionKey: 'edit_file',
       isAskUser: false,
       label: '修改文件',
       detail: file || '',
@@ -1730,6 +2352,7 @@ export function summarizeToolCall(rawToolCall, fallbackStep = null) {
     );
     return {
       toolName: nameLower,
+      actionKey: 'write_file',
       isAskUser: false,
       label: '写入文件',
       detail: file || '',
@@ -1745,6 +2368,7 @@ export function summarizeToolCall(rawToolCall, fallbackStep = null) {
         : cleanSingleLineSnippet(query, 48) || searchPath || '';
     return {
       toolName: nameLower,
+      actionKey: 'grep_search',
       isAskUser: false,
       label: '搜索代码',
       detail,
@@ -1756,6 +2380,7 @@ export function summarizeToolCall(rawToolCall, fallbackStep = null) {
     const dir = shortBasename(pickField(['SearchDirectory', 'DirectoryPath', 'Path']));
     return {
       toolName: nameLower,
+      actionKey: 'find_file',
       isAskUser: false,
       label: '查找文件',
       detail: pattern && dir ? `${pattern} (${dir})` : pattern || dir || '',
@@ -1767,6 +2392,7 @@ export function summarizeToolCall(rawToolCall, fallbackStep = null) {
     const target = pickField(['query', 'Query', 'Url', 'url']);
     return {
       toolName: nameLower,
+      actionKey: isUrl ? 'read_url' : 'search_web',
       isAskUser: false,
       label: isUrl ? '读取网页' : '网页搜索',
       detail: cleanSingleLineSnippet(target, 52) || '',
@@ -1782,6 +2408,7 @@ export function summarizeToolCall(rawToolCall, fallbackStep = null) {
       String(subSpec.typeName || '').trim();
     return {
       toolName: nameLower,
+      actionKey: 'invoke_subagent',
       isAskUser: false,
       label: '调用子代理',
       detail: role || '',
@@ -1792,6 +2419,7 @@ export function summarizeToolCall(rawToolCall, fallbackStep = null) {
     const recipient = pickField(['Recipient', 'recipient']);
     return {
       toolName: nameLower,
+      actionKey: 'send_message',
       isAskUser: false,
       label: '通信子代理',
       detail: recipient ? recipient.slice(0, 8) : '',
@@ -1802,9 +2430,148 @@ export function summarizeToolCall(rawToolCall, fallbackStep = null) {
     const subName = pickField(['Name', 'Action', 'action']);
     return {
       toolName: nameLower,
+      actionKey: 'manage_subagents',
       isAskUser: false,
       label: '管理子代理',
       detail: subName || '',
+    };
+  }
+
+  if (nameLower === 'swarm') {
+    const action = pickField(['action', 'Action']).toLowerCase();
+    const memberName = pickField(['name', 'Name']).replace(/^@+/, '').trim();
+    if (action === 'add') {
+      const rawTasks = unwrapArgValue(args?.tasks);
+      const rawCount = Number(unwrapArgValue(args?.n) || 0);
+      const shardCount = Array.isArray(rawTasks) && rawTasks.length > 1
+        ? rawTasks.length
+        : rawCount > 1
+          ? Math.floor(rawCount)
+          : 0;
+      const detail = memberName
+        ? shardCount > 1
+          ? `@${memberName}-1..${shardCount}`
+          : `@${memberName}`
+        : '';
+      return {
+        toolName: nameLower,
+        actionKey: 'swarm_add',
+        isAskUser: false,
+        label: '派生工蜂',
+        detail,
+      };
+    }
+    if (action === 'title') {
+      return {
+        toolName: nameLower,
+        actionKey: 'swarm_title',
+        isAskUser: false,
+        label: '命名蜂群',
+        detail: cleanSingleLineSnippet(pickField(['title', 'Title']), 44) || '',
+      };
+    }
+    if (action === 'kill') {
+      return {
+        toolName: nameLower,
+        actionKey: 'swarm_kill',
+        isAskUser: false,
+        label: '终止工蜂',
+        detail: memberName ? `@${memberName}` : '',
+      };
+    }
+    if (action === 'model') {
+      const target = memberName ? `@${memberName}` : '@coordinator';
+      const nextModel = pickField(['model', 'Model']);
+      return {
+        toolName: nameLower,
+        actionKey: 'swarm_model',
+        isAskUser: false,
+        label: '切换工蜂模型',
+        detail: nextModel ? `${target} -> ${nextModel}` : target,
+      };
+    }
+    if (action === 'channel') {
+      const op = pickField(['op', 'Op']);
+      const ch = pickField(['channel', 'Channel']).replace(/^#+/, '').trim();
+      return {
+        toolName: nameLower,
+        actionKey: 'swarm_channel',
+        isAskUser: false,
+        label: '蜂群频道',
+        detail: ch ? `${op ? `${op} ` : ''}#${ch}` : op || '',
+      };
+    }
+    return {
+      toolName: nameLower,
+      actionKey: 'swarm_status',
+      isAskUser: false,
+      label: '巡检蜂群',
+      detail: action || 'status',
+    };
+  }
+
+  if (nameLower === 'post_message') {
+    const channel = pickField(['channel', 'Channel']).replace(/^#+/, '').trim();
+    const textSnippet = cleanSingleLineSnippet(pickField(['text', 'Text']), 48);
+    const detail =
+      channel && channel !== 'main'
+        ? `[#${channel}]${textSnippet ? ` ${textSnippet}` : ''}`
+        : textSnippet || '';
+    return {
+      toolName: nameLower,
+      actionKey: 'post_message',
+      isAskUser: false,
+      label: '发布看板',
+      detail,
+    };
+  }
+
+  if (nameLower === 'read_board') {
+    const rawStatus = unwrapArgValue(args?.status) ?? pickField(['status']);
+    const isStatus = String(rawStatus).trim().toLowerCase() === 'true';
+    const rawSeqs = unwrapArgValue(args?.seqs);
+    const seqsLabel =
+      Array.isArray(rawSeqs) && rawSeqs.length > 0
+        ? `${rawSeqs
+            .slice(0, 4)
+            .map((n) => `#${String(unwrapArgValue(n) ?? n).trim()}`)
+            .join(', ')}${rawSeqs.length > 4 ? '…' : ''}`
+        : '';
+    const sinceVal = unwrapArgValue(args?.since) ?? pickField(['since']);
+    const channel = pickField(['channel', 'Channel']).replace(/^#+/, '').trim();
+    const detail = isStatus
+      ? 'status'
+      : [
+          channel && channel !== 'main' ? `#${channel}` : '',
+          seqsLabel ||
+            (sinceVal !== undefined && sinceVal !== null && String(sinceVal).trim() !== ''
+              ? `#${String(sinceVal).trim()}+`
+              : ''),
+        ]
+          .filter(Boolean)
+          .join(' ');
+    return {
+      toolName: nameLower,
+      actionKey: 'read_board',
+      isAskUser: false,
+      label: '读取看板',
+      detail,
+    };
+  }
+
+  if (nameLower === 'swarm_wait') {
+    const sinceVal = unwrapArgValue(args?.since) ?? pickField(['since']);
+    const detail =
+      sinceVal !== undefined && sinceVal !== null && String(sinceVal).trim() !== ''
+        ? `#${String(sinceVal).trim()}+`
+        : '';
+    return {
+      toolName: nameLower,
+      actionKey: 'swarm_wait',
+      isAskUser: false,
+      isSwarmWait: true,
+      label: '看板待命',
+      detail,
     };
   }
 
@@ -1813,6 +2580,7 @@ export function summarizeToolCall(rawToolCall, fallbackStep = null) {
     const taskId = pickField(['TaskId', 'taskId']);
     return {
       toolName: nameLower,
+      actionKey: 'manage_task',
       isAskUser: false,
       label: '后台任务',
       detail: taskId ? `${action || 'status'} (${taskId})` : action || '',
@@ -1824,6 +2592,7 @@ export function summarizeToolCall(rawToolCall, fallbackStep = null) {
     const cron = pickField(['CronExpression']);
     return {
       toolName: nameLower,
+      actionKey: 'schedule',
       isAskUser: false,
       label: '定时任务',
       detail: dur ? `${dur}s` : cron || '',
@@ -1840,6 +2609,7 @@ export function summarizeToolCall(rawToolCall, fallbackStep = null) {
       );
     return {
       toolName: nameLower,
+      actionKey: 'ask_question',
       isAskUser: true,
       label: '等待用户选择',
       detail: cleanSingleLineSnippet(qText, 50) || '',
@@ -1851,6 +2621,7 @@ export function summarizeToolCall(rawToolCall, fallbackStep = null) {
     const q = Array.isArray(rawQueries) ? rawQueries.join(', ') : '';
     return {
       toolName: nameLower,
+      actionKey: 'search_marketplace',
       isAskUser: false,
       label: '查询插件',
       detail: cleanSingleLineSnippet(q, 48) || '',
@@ -1861,6 +2632,7 @@ export function summarizeToolCall(rawToolCall, fallbackStep = null) {
     const mcpClean = nameLower.replace(/^mcp[_-]/i, '').replace(/_/g, ' · ');
     return {
       toolName: nameLower,
+      actionKey: 'mcp_tool',
       isAskUser: false,
       label: '调用 MCP',
       detail: mcpClean || '',
@@ -1869,6 +2641,7 @@ export function summarizeToolCall(rawToolCall, fallbackStep = null) {
 
   return {
     toolName: nameLower || 'tool',
+    actionKey: 'tool_call',
     isAskUser: false,
     label: '调用工具',
     detail: nameLower || '',
@@ -1916,6 +2689,9 @@ export function extractLiveActivity(rawSteps = [], isRunning = false, fallbackSt
     const startMs = Math.floor(fallbackStartMs || 0);
     return {
       phase: 'thinking',
+      actionKey: 'thinking',
+      waitingApproval: false,
+      detailKey: '',
       label: '推理中',
       detail: '',
       stepProgress: '',
@@ -1965,6 +2741,9 @@ export function extractLiveActivity(rawSteps = [], isRunning = false, fallbackSt
     if (isCheckpointStep(lastStep)) {
       return {
         phase: 'compacting',
+        actionKey: 'compacting',
+        waitingApproval: false,
+        detailKey: '',
         label: '上下文压缩',
         detail: '',
         stepProgress: '',
@@ -1985,14 +2764,18 @@ export function extractLiveActivity(rawSteps = [], isRunning = false, fallbackSt
         const info = summarizeToolCall(activeTool, lastStep);
         const stepProgress =
           tools.length > 1 && !hasBracketPrefix(info.detail) ? `${tools.length}/${tools.length}` : '';
-        const phase = info.isAskUser ? 'waiting' : 'tool';
+        const phase = info.isAskUser || info.isSwarmWait ? 'waiting' : 'tool';
         return {
           phase,
+          toolName: info.toolName,
+          actionKey: info.actionKey,
+          waitingApproval: false,
+          detailKey: '',
           label: info.label,
           detail: info.detail,
           stepProgress,
           startedAtMs: startMs,
-          signature: `planner-tool:${lastStepId}:${tools.length}:${info.label}:${info.detail}`,
+          signature: `planner-tool:${lastStepId}:${tools.length}:${info.actionKey}:${info.detail}`,
           liveStepKey,
           liveEstTokens,
         };
@@ -2002,6 +2785,9 @@ export function extractLiveActivity(rawSteps = [], isRunning = false, fallbackSt
         const snippet = cleanSingleLineSnippet(respText, 52, true);
         return {
           phase: 'responding',
+          actionKey: 'responding',
+          waitingApproval: false,
+          detailKey: '',
           label: '正在输出回复',
           detail: snippet,
           stepProgress: '',
@@ -2016,6 +2802,9 @@ export function extractLiveActivity(rawSteps = [], isRunning = false, fallbackSt
         const snippet = cleanSingleLineSnippet(thinkText, 52, true);
         return {
           phase: 'thinking',
+          actionKey: 'thinking',
+          waitingApproval: false,
+          detailKey: '',
           label: '推理中',
           detail: snippet,
           stepProgress: '',
@@ -2028,6 +2817,9 @@ export function extractLiveActivity(rawSteps = [], isRunning = false, fallbackSt
 
       return {
         phase: 'thinking',
+        actionKey: 'thinking',
+        waitingApproval: false,
+        detailKey: '',
         label: '推理中',
         detail: '',
         stepProgress: '',
@@ -2063,17 +2855,22 @@ export function extractLiveActivity(rawSteps = [], isRunning = false, fallbackSt
     if (hasBracketPrefix(info.detail)) {
       stepProgress = '';
     }
-    const waiting = isWaitingStepStatus(lastStep?.status) || info.isAskUser;
+    const waiting = isWaitingStepStatus(lastStep?.status) || info.isAskUser || Boolean(info.isSwarmWait);
+    const waitingApproval = Boolean(waiting && !info.isAskUser && !info.isSwarmWait);
     const resolvedStartMs = startMs || prevStepEndMs || 0;
-    const label = waiting && !info.isAskUser ? `等待确认 · ${info.label}` : info.label;
+    const label = waitingApproval ? `等待确认 · ${info.label}` : info.label;
 
     return {
       phase: waiting ? 'waiting' : 'tool',
+      toolName: info.toolName,
+      actionKey: info.actionKey,
+      waitingApproval,
+      detailKey: '',
       label,
       detail: info.detail,
       stepProgress,
       startedAtMs: resolvedStartMs,
-      signature: `step-run:${lastStepId}:${waiting}:${label}:${stepProgress}:${info.detail}`,
+      signature: `step-run:${lastStepId}:${waiting}:${info.actionKey}:${stepProgress}:${info.detail}`,
     };
   }
 
@@ -2109,6 +2906,9 @@ export function extractLiveActivity(rawSteps = [], isRunning = false, fallbackSt
         Math.floor(fallbackStartMs || 0);
       return {
         phase: 'compacting',
+        actionKey: 'compacting',
+        waitingApproval: false,
+        detailKey: cpFinishMs > 0 ? 'compaction_resuming' : '',
         label: '上下文压缩',
         detail: cpFinishMs > 0 ? '已完成压缩，正在恢复推理' : '',
         stepProgress: '',
@@ -2147,15 +2947,19 @@ export function extractLiveActivity(rawSteps = [], isRunning = false, fallbackSt
         getRawStepEndMs(lastStep) ||
         getRawStepEndMs(plannerStep) ||
         0;
-      const phase = info.isAskUser ? 'waiting' : 'tool';
+      const phase = info.isAskUser || info.isSwarmWait ? 'waiting' : 'tool';
 
       return {
         phase,
+        toolName: info.toolName,
+        actionKey: info.actionKey,
+        waitingApproval: false,
+        detailKey: '',
         label: info.label,
         detail: info.detail,
         stepProgress,
         startedAtMs: startMs,
-        signature: `pending-tool:${plannerStepId}:${completedAfterPlanner}:${info.label}:${stepProgress}:${info.detail}`,
+        signature: `pending-tool:${plannerStepId}:${completedAfterPlanner}:${info.actionKey}:${stepProgress}:${info.detail}`,
       };
     }
 
@@ -2164,8 +2968,24 @@ export function extractLiveActivity(rawSteps = [], isRunning = false, fallbackSt
       const infos = pTools.map((t, idx) =>
         summarizeToolCall(t, toolStepsAfterPlanner[idx] || lastStep)
       );
+      const swarmWaitInfo = infos.find((x) => x.isSwarmWait);
+      if (swarmWaitInfo) {
+        const startMs = getRawStepFinishMs(lastStep) || getRawStepEndMs(lastStep) || 0;
+        return {
+          phase: 'waiting',
+          toolName: swarmWaitInfo.toolName,
+          actionKey: swarmWaitInfo.actionKey,
+          waitingApproval: false,
+          detailKey: '',
+          label: swarmWaitInfo.label,
+          detail: swarmWaitInfo.detail,
+          stepProgress: '',
+          startedAtMs: startMs,
+          signature: `swarm-wait:${lastStepId}:${swarmWaitInfo.detail}`,
+        };
+      }
       const lastToolInfo = infos[infos.length - 1];
-      const allSameLabel = infos.every((x) => x.label === lastToolInfo.label);
+      const allSameLabel = infos.every((x) => x.actionKey === lastToolInfo.actionKey);
       const detailsList = infos.map((x) => x.detail).filter(Boolean);
       const combinedDetail =
         infos.length > 1 && allSameLabel
@@ -2178,28 +2998,51 @@ export function extractLiveActivity(rawSteps = [], isRunning = false, fallbackSt
       const startMs = getRawStepFinishMs(lastStep) || getRawStepEndMs(lastStep) || 0;
       return {
         phase: 'thinking',
+        toolName: lastToolInfo.toolName,
+        actionKey: lastToolInfo.actionKey,
+        waitingApproval: false,
+        detailKey: '',
         label: lastToolInfo.label,
         detail: combinedDetail,
         stepProgress,
         startedAtMs: startMs,
-        signature: `post-tool-think:${lastStepId}:${lastToolInfo.label}:${combinedDetail}`,
+        signature: `post-tool-think:${lastStepId}:${lastToolInfo.actionKey}:${combinedDetail}`,
       };
     }
 
-    // B2.5：Connect RPC 轨迹中工具作为独立步骤存在（plannerResponse.toolCalls 为空）时，直接提取最后一个工具步骤的目标文件/命令
+    // B2.5：Connect RPC / SQLite 轨迹中工具作为独立步骤存在（plannerResponse.toolCalls 为空）时，直接提取最后一个工具步骤的目标文件/命令
     if (lastIdx > lastPlannerIdx) {
       const stepTypeUpper = String(lastStep?.type || '').toUpperCase();
-      if (!stepTypeUpper.includes('USER_INPUT') && !stepTypeUpper.includes('GENERIC')) {
+      const hasStepToolMeta = Boolean(lastStep?.metadata?.toolCall?.name);
+      if (!stepTypeUpper.includes('USER_INPUT') && (!stepTypeUpper.includes('GENERIC') || hasStepToolMeta)) {
         const lastInfo = summarizeToolCall(null, lastStep);
         if (lastInfo.toolName !== 'tool' || lastInfo.detail) {
           const startMs = getRawStepFinishMs(lastStep) || getRawStepEndMs(lastStep) || 0;
+          if (lastInfo.isSwarmWait) {
+            return {
+              phase: 'waiting',
+              toolName: lastInfo.toolName,
+              actionKey: lastInfo.actionKey,
+              waitingApproval: false,
+              detailKey: '',
+              label: lastInfo.label,
+              detail: lastInfo.detail,
+              stepProgress: '',
+              startedAtMs: startMs,
+              signature: `swarm-wait:${lastStepId}:${lastInfo.detail}`,
+            };
+          }
           return {
             phase: 'thinking',
+            toolName: lastInfo.toolName,
+            actionKey: lastInfo.actionKey,
+            waitingApproval: false,
+            detailKey: '',
             label: lastInfo.label,
             detail: lastInfo.detail,
             stepProgress: '',
             startedAtMs: startMs,
-            signature: `post-step-tool:${lastStepId}:${lastInfo.label}:${lastInfo.detail}`,
+            signature: `post-step-tool:${lastStepId}:${lastInfo.actionKey}:${lastInfo.detail}`,
           };
         }
       }
@@ -2215,6 +3058,9 @@ export function extractLiveActivity(rawSteps = [], isRunning = false, fallbackSt
         if (snippet) {
           return {
             phase: 'responding',
+            actionKey: 'responding',
+            waitingApproval: false,
+            detailKey: '',
             label: '正在输出回复',
             detail: snippet,
             stepProgress: '',
@@ -2228,6 +3074,9 @@ export function extractLiveActivity(rawSteps = [], isRunning = false, fallbackSt
         if (snippet) {
           return {
             phase: 'thinking',
+            actionKey: 'thinking',
+            waitingApproval: false,
+            detailKey: '',
             label: '推理中',
             detail: snippet,
             stepProgress: '',
@@ -2243,6 +3092,9 @@ export function extractLiveActivity(rawSteps = [], isRunning = false, fallbackSt
   const startMs = getRawStepFinishMs(lastStep) || getRawStepStartMs(lastStep) || 0;
   return {
     phase: 'thinking',
+    actionKey: 'thinking',
+    waitingApproval: false,
+    detailKey: '',
     label: '推理中',
     detail: '',
     stepProgress: '',
@@ -2250,4 +3102,102 @@ export function extractLiveActivity(rawSteps = [], isRunning = false, fallbackSt
     signature: `post-step-think:${lastStepId}`,
   };
 }
+
+/**
+ * 识别并规范化蜂群（Native Swarm）工蜂节点的身份信息，剥离冗余的 `Swarm Worker (<name>)` 包裹。
+ *
+ * @param {{ role?: string, typeName?: string, agentScriptName?: string, memberName?: string }} [input={}]
+ * @returns {{ isSwarmWorker: boolean, memberName: string, isMonitor: boolean, isNarrator: boolean, isAuxiliary: boolean }}
+ */
+export function parseSwarmWorkerRole(input = {}) {
+  const rawRole = String(input?.role || '').trim();
+  const rawType = String(input?.typeName || '').trim().toLowerCase();
+  const rawScript = String(input?.agentScriptName || '').trim();
+  const explicitMember = String(input?.memberName || '').trim();
+
+  const wrapperMatch = rawRole.match(/^Swarm\s+Worker\s*\(([^)]+)\)\s*$/i);
+  const isSwarmWorker = Boolean(
+    explicitMember || wrapperMatch || rawType === 'worker' || rawType === 'swarm_worker'
+  );
+  if (!isSwarmWorker) {
+    return {
+      isSwarmWorker: false,
+      memberName: '',
+      isMonitor: false,
+      isNarrator: false,
+      isAuxiliary: false,
+    };
+  }
+
+  const candidate =
+    explicitMember ||
+    (wrapperMatch ? wrapperMatch[1] : '') ||
+    rawScript ||
+    (rawRole.toLowerCase() !== 'worker' && rawRole.toLowerCase() !== 'swarm worker' ? rawRole : '');
+  const memberName = String(candidate || '').replace(/^@+/, '').trim();
+  const isMonitor = /^monitor(?:-\d+)?$/i.test(memberName);
+  const isNarrator = /^narrator(?:-\d+)?$/i.test(memberName);
+  return {
+    isSwarmWorker: true,
+    memberName,
+    isMonitor,
+    isNarrator,
+    isAuxiliary: isMonitor || isNarrator,
+  };
+}
+
+/**
+ * 判断原始轨迹步骤是否已调用 `swarm_wait` 进入留言板待命状态（且后续尚未收到新的用户提问或系统唤醒消息）。
+ *
+ * @param {Array<object>} [rawSteps=[]]
+ * @returns {boolean}
+ */
+export function isParkedOnSwarmWait(rawSteps = []) {
+  if (!Array.isArray(rawSteps) || rawSteps.length === 0) return false;
+  let lastIdx = rawSteps.length - 1;
+  while (lastIdx > 0 && isAuxiliaryMetaStep(rawSteps[lastIdx]) && isRawStepComplete(rawSteps[lastIdx])) {
+    lastIdx--;
+  }
+  let lastPlannerIdx = -1;
+  for (let i = lastIdx; i >= 0; i--) {
+    const st = rawSteps[i];
+    const t = String(st?.type || '').trim().toUpperCase();
+    if (t.includes('USER_INPUT') || t.includes('SYSTEM_MESSAGE') || isCheckpointStep(st)) {
+      return false;
+    }
+    if (isPlannerStep(st)) {
+      lastPlannerIdx = i;
+      break;
+    }
+  }
+  if (lastPlannerIdx < 0) return false;
+
+  const pTools = getStepPlannerToolCalls(rawSteps[lastPlannerIdx]);
+  if (
+    pTools.some((tc) => {
+      const n = String(tc?.name || tc?.toolName || tc?.function?.name || '')
+        .trim()
+        .toLowerCase()
+        .replace(/^default_api:/, '');
+      return n === 'swarm_wait';
+    })
+  ) {
+    return true;
+  }
+
+  for (let k = lastPlannerIdx + 1; k <= lastIdx; k++) {
+    const st = rawSteps[k];
+    const toolName = String(st?.metadata?.toolCall?.name || '')
+      .trim()
+      .toLowerCase()
+      .replace(/^default_api:/, '');
+    if (toolName === 'swarm_wait') return true;
+    const rawContent = String(st?.content || '').trim();
+    if (/Waiting for a message that calls on you|Waiting for any message posted after/i.test(rawContent)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 

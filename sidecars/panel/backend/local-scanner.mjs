@@ -10,57 +10,129 @@
 
 import { closeSync, existsSync, openSync, readFileSync, readSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
+import { isDeepStrictEqual } from 'node:util';
 import {
   computeLiveStreamTokPerSec,
   extractLiveActivity,
   extractModelSteps,
   getMaxMeaningfulStepIndex,
+  isParkedOnSwarmWait,
   parseIsoMs,
-} from '../speed-metrics.mjs';
+  parseSwarmWorkerRole,
+} from '../trajectory-metrics.mjs';
 import {
+  ANNOTATION_DIRS,
   BRAIN_DIR,
-  CACHE_FILE,
+  BRAIN_DIRS,
   CACHE_SCHEMA_VERSION,
   CONVERSATIONS_DIR,
+  CONVERSATION_DIRS,
   DEEP_STATS_CACHE_CANDIDATES,
-  cacheState,
+  getCachedTrajectory,
+  hasPendingTrajectoryCacheSave,
+  listCachedTrajectoryEntries,
   externalDeepStatsMemo,
   loadJson,
-  saveJson,
-  trajectoryCache,
+  persistTrajectoryCacheIfNeeded,
+  removeCachedTrajectory,
+  setCachedTrajectory,
 } from './config.mjs';
+import {
+  computeSqliteWalSig,
+  hasBuiltinNodeSqlite,
+  readAnnotationTitleForCascade,
+  readLocalSqliteTrajectory,
+  readLocalSummaryIndex,
+} from './cli-sqlite-reader.mjs';
 import { callLsRpc } from './ls-rpc.mjs';
 import { formatGenericModelSlug, getBaseModelLabel } from './model-pricing.mjs';
+import { PLACEHOLDER_MAP } from './pricing-catalog.mjs';
+
+const CONV_FILE_RE = /^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.(db|pb|db-wal)$/i;
+const TRANSCRIPT_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /**
- * 扫描本地 `conversations` 目录，返回 `cascadeId -> 最新磁盘修改时间 (mtimeMs)` 映射表。
+ * 联合扫描本地多端（Desktop / CLI / IDE）的 `conversations` 与 `brain/<id>/.system_generated/logs/transcript.jsonl`，
+ * 按小写 `cascadeId` 归并关联磁盘文件路径。
  *
- * @returns {Map<string, number>}
+ * @returns {Map<string, string[]>}
  */
 function discoverLocalConversationFiles() {
   const map = new Map();
-  if (!existsSync(CONVERSATIONS_DIR)) return map;
-  try {
-    for (const name of readdirSync(CONVERSATIONS_DIR)) {
-      const m = name.match(
-        /^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.(db|pb|db-wal)$/i
-      );
-      if (!m) continue;
-      const cascadeId = m[1].toLowerCase();
+  const convDirs =
+    Array.isArray(CONVERSATION_DIRS) && CONVERSATION_DIRS.length > 0
+      ? CONVERSATION_DIRS
+      : [CONVERSATIONS_DIR];
+  for (const dir of convDirs) {
+    if (!dir || !existsSync(dir)) continue;
+    try {
+      for (const rawName of readdirSync(dir)) {
+        const name = String(rawName || '');
+        const m = name.match(CONV_FILE_RE);
+        if (!m) continue;
+        const cascadeId = m[1].toLowerCase();
+        if (!map.has(cascadeId)) map.set(cascadeId, []);
+        map.get(cascadeId).push(join(dir, name));
+      }
+    } catch {
+      // 忽略目录读取异常
+    }
+  }
+
+  const brainDirs =
+    Array.isArray(BRAIN_DIRS) && BRAIN_DIRS.length > 0 ? BRAIN_DIRS : [BRAIN_DIR];
+  for (const dir of brainDirs) {
+    if (!dir || !existsSync(dir)) continue;
+    try {
+      for (const rawName of readdirSync(dir)) {
+        const name = String(rawName || '').trim();
+        const cascadeId = name.toLowerCase();
+        if (!TRANSCRIPT_UUID_RE.test(cascadeId)) continue;
+        const transcriptPath = join(dir, name, '.system_generated', 'logs', 'transcript.jsonl');
+        if (!existsSync(transcriptPath)) continue;
+        if (!map.has(cascadeId)) map.set(cascadeId, []);
+        map.get(cascadeId).push(transcriptPath);
+      }
+    } catch {
+      // 忽略目录读取异常
+    }
+  }
+
+  const annotationDirs = Array.isArray(ANNOTATION_DIRS) ? ANNOTATION_DIRS : [];
+  if (annotationDirs.length > 0 && map.size > 0) {
+    for (const annDir of annotationDirs) {
+      if (!annDir || !existsSync(annDir)) continue;
       try {
-        const st = statSync(join(CONVERSATIONS_DIR, name));
-        const prevMtime = map.get(cascadeId) || 0;
-        if (st.mtimeMs > prevMtime) {
-          map.set(cascadeId, st.mtimeMs);
+        for (const rawName of readdirSync(annDir)) {
+          const name = String(rawName || '');
+          if (!name.toLowerCase().endsWith('.pbtxt')) continue;
+          const cascadeId = name.slice(0, -6).toLowerCase();
+          const fileList = map.get(cascadeId);
+          if (fileList) {
+            fileList.push(join(annDir, name));
+          }
         }
       } catch {
-        if (!map.has(cascadeId)) map.set(cascadeId, 0);
+        // 忽略注释目录读取异常
       }
     }
-  } catch {
-    // 忽略目录读取异常
   }
   return map;
+}
+
+function readConversationMtime(files = []) {
+  let mtimeMs = 0;
+  for (const nameOrPath of files) {
+    try {
+      const fullPath = /[\\/]|^[a-zA-Z]:/.test(nameOrPath)
+        ? nameOrPath
+        : join(CONVERSATIONS_DIR, nameOrPath);
+      mtimeMs = Math.max(mtimeMs, Number(statSync(fullPath)?.mtimeMs || 0));
+    } catch {
+      // 轨迹文件可能在目录枚举后被宿主删除。
+    }
+  }
+  return mtimeMs;
 }
 
 /**
@@ -100,9 +172,23 @@ export function loadExternalDeepStatsCache() {
 
     for (const item of Object.values(raw.perConvo)) {
       for (const e of item?.entries || []) {
+        const intrinsicDisplay =
+          PLACEHOLDER_MAP[e?.modelRuntimeId]?.label ||
+          formatGenericModelSlug(e?.modelCanonicalId || e?.model);
+        const isSessionDisplayAgg = /^session-display:/i.test(String(e?.modelAggregationId || ''));
+        const usableDisplayHint =
+          e?.modelDisplayName &&
+          !(
+            isSessionDisplayAgg &&
+            intrinsicDisplay &&
+            getBaseModelLabel(e.modelDisplayName) !== getBaseModelLabel(intrinsicDisplay)
+          )
+            ? e.modelDisplayName
+            : '';
         const display =
-          e?.modelDisplayName ||
-          formatGenericModelSlug(e?.modelCanonicalId || e?.model || e?.modelAggregationId);
+          usableDisplayHint ||
+          intrinsicDisplay ||
+          formatGenericModelSlug(e?.modelAggregationId);
         if (!display) continue;
         const base = getBaseModelLabel(display);
         if (e?.modelRuntimeId && !runtimeDisplayMap.has(e.modelRuntimeId)) {
@@ -141,18 +227,41 @@ export function loadExternalDeepStatsCache() {
         if (inputTokens === 0 && cacheReadTokens === 0 && outputTokens === 0) continue;
         const createdAtMs = e?.ts ? Date.parse(e.ts) || 0 : 0;
         if (createdAtMs > lastModifiedMs) lastModifiedMs = createdAtMs;
+        const stepIntrinsicLabel =
+          PLACEHOLDER_MAP[e?.modelRuntimeId]?.label ||
+          formatGenericModelSlug(e?.modelCanonicalId || e?.model);
+        const isSessionDisplayAgg = /^session-display:/i.test(String(e?.modelAggregationId || ''));
+        const safeStepDisplayName =
+          e?.modelDisplayName &&
+          !(
+            isSessionDisplayAgg &&
+            stepIntrinsicLabel &&
+            getBaseModelLabel(e.modelDisplayName) !== getBaseModelLabel(stepIntrinsicLabel)
+          )
+            ? e.modelDisplayName
+            : '';
         const resolvedDisplay =
-          e?.modelDisplayName ||
+          safeStepDisplayName ||
+          stepIntrinsicLabel ||
           runtimeDisplayMap.get(e?.model) ||
           runtimeDisplayMap.get(e?.modelRuntimeId) ||
-          formatGenericModelSlug(e?.modelCanonicalId || e?.model || e?.modelAggregationId) ||
+          formatGenericModelSlug(e?.modelAggregationId) ||
           '';
+        const rawUpstreamCandidate = String(e?.model || e?.modelCanonicalId || '').trim();
+        const inferredResponseModel =
+          /^session:/i.test(String(e?.modelAggregationId || '')) &&
+          rawUpstreamCandidate &&
+          !/^MODEL_/i.test(rawUpstreamCandidate) &&
+          !/\s/.test(rawUpstreamCandidate)
+            ? rawUpstreamCandidate
+            : '';
         steps.push({
           stepIndex: idx + 1,
           createdAt: e?.ts || '',
           createdAtMs,
           modelKey: e?.modelCanonicalId || e?.model || e?.modelRuntimeId || 'unknown',
           modelDisplayName: resolvedDisplay,
+          ...(inferredResponseModel ? { responseModel: inferredResponseModel } : {}),
           apiProvider: e?.provider || '',
           appSource,
           inputTokens,
@@ -182,6 +291,69 @@ export function loadExternalDeepStatsCache() {
 
 const MAX_CONCURRENT_RPC = 4;
 const LEGACY_MIGRATION_BATCH_SIZE = 8;
+const stepFieldChecks = new WeakMap();
+
+function normalizeOwnerAccount(value) {
+  return typeof value === 'string' ? value.trim().toLowerCase() : '';
+}
+
+/**
+ * 为会话步骤维护细粒度账号归属：
+ * - 已存在于旧缓存中的历史步骤保留原归属账号（兼容跨账号续聊同一会话）；
+ * - 切换账号后在该会话中新产生的步骤写入当前活跃账号 `step.accountName`，仅供「可用额度」按账号隔离统计。
+ */
+function attachStepAccountOwners(steps, prev, currentAccountName, entryAccountName) {
+  if (!Array.isArray(steps) || steps.length === 0) return steps;
+  const activeOwner = normalizeOwnerAccount(currentAccountName);
+  const entryOwner = normalizeOwnerAccount(entryAccountName);
+  const prevOwner = normalizeOwnerAccount(prev?.accountName);
+  const prevSteps = Array.isArray(prev?.steps) ? prev.steps : [];
+
+  if (prevSteps.length === 0) {
+    const initialOwner = prevOwner || activeOwner || entryOwner;
+    if (!initialOwner || initialOwner === entryOwner) return steps;
+    return steps.map((s) => ({ ...s, accountName: initialOwner }));
+  }
+
+  const prevByIndex = new Map();
+  let maxPrevStepIndex = -1;
+  let maxPrevCreatedAtMs = 0;
+  for (const ps of prevSteps) {
+    if (!ps || typeof ps !== 'object') continue;
+    const idx = Number(ps.stepIndex);
+    if (Number.isFinite(idx)) {
+      prevByIndex.set(idx, ps);
+      if (idx > maxPrevStepIndex) maxPrevStepIndex = idx;
+    }
+    const cMs = Number(ps.createdAtMs || 0);
+    if (cMs > maxPrevCreatedAtMs) maxPrevCreatedAtMs = cMs;
+  }
+
+  let mutated = false;
+  const out = steps.map((s) => {
+    const idx = Number(s?.stepIndex);
+    const matchedPrev = Number.isFinite(idx) ? prevByIndex.get(idx) : null;
+    let stepOwner = '';
+    if (matchedPrev) {
+      stepOwner = normalizeOwnerAccount(matchedPrev.accountName) || prevOwner;
+    } else {
+      const cMs = Number(s?.createdAtMs || 0);
+      const isHistoricalBackfill =
+        (Number.isFinite(idx) && maxPrevStepIndex >= 0 && idx <= maxPrevStepIndex) ||
+        (cMs > 0 && maxPrevCreatedAtMs > 0 && cMs <= maxPrevCreatedAtMs);
+      stepOwner = isHistoricalBackfill ? prevOwner || activeOwner : activeOwner || prevOwner;
+    }
+    const storedAccount = stepOwner && stepOwner !== entryOwner ? stepOwner : undefined;
+    if (s?.accountName === storedAccount) return s;
+    mutated = true;
+    if (storedAccount) {
+      return { ...s, accountName: storedAccount };
+    }
+    const { accountName: _removed, ...rest } = s;
+    return rest;
+  });
+  return mutated ? out : steps;
+}
 const MAX_SUBAGENT_RECONCILE_DEPTH = 4;
 const FAILED_RPC_COOLDOWN_MS = 60_000;
 const ACTIVE_FAILED_RPC_COOLDOWN_MS = 15_000;
@@ -192,6 +364,15 @@ const failedFetchCooldownMap = new Map();
 const liveActivityMemo = new Map();
 const liveSpeedTrackerMap = new Map();
 const transcriptTailMemo = new Map();
+const swarmManifestMemo = new Map();
+
+export function clearScannerRuntimeMemos() {
+  failedFetchCooldownMap.clear();
+  liveActivityMemo.clear();
+  liveSpeedTrackerMap.clear();
+  transcriptTailMemo.clear();
+  swarmManifestMemo.clear();
+}
 
 /**
  * 为正在运行的会话跟踪流式生成 Token 增量并计算平滑后的实时吐字速率（`liveTokPerSec`）。
@@ -213,7 +394,6 @@ function attachLiveStreamSpeed(cascadeId, liveAct, nowMs = Date.now()) {
   const stepKey = String(liveAct.liveStepKey || '');
   const estTokens = Number(liveAct.liveEstTokens || 0);
   if (!stepKey || !(estTokens > 0)) {
-    // 处于等待首字或工具执行阶段时，清空旧步骤残留速率；若同一步刚等待首字则保留空跟踪器
     const existing = liveSpeedTrackerMap.get(key);
     if (existing && existing.stepKey !== stepKey) {
       liveSpeedTrackerMap.delete(key);
@@ -225,7 +405,6 @@ function attachLiveStreamSpeed(cascadeId, liveAct, nowMs = Date.now()) {
   if (!tracker || tracker.stepKey !== stepKey) {
     tracker = { stepKey, samples: [], smoothedTps: null };
     liveSpeedTrackerMap.set(key, tracker);
-    // 限制跟踪器容量，防止长时间运行累积陈旧会话键
     if (liveSpeedTrackerMap.size > 64) {
       const oldestKey = liveSpeedTrackerMap.keys().next().value;
       if (oldestKey && oldestKey !== key) {
@@ -235,7 +414,6 @@ function attachLiveStreamSpeed(cascadeId, liveAct, nowMs = Date.now()) {
   }
 
   const lastSample = tracker.samples[tracker.samples.length - 1];
-  // 防止 transcript 与 RPC 切换导致的偶发倒退，保持估算 Token 单调非减
   const monotonicTokens = lastSample ? Math.max(lastSample.tokens, estTokens) : estTokens;
   if (!lastSample || nowMs - lastSample.tsMs >= 150 || monotonicTokens > lastSample.tokens) {
     tracker.samples.push({ tsMs: nowMs, tokens: monotonicTokens });
@@ -257,6 +435,702 @@ function attachLiveStreamSpeed(cascadeId, liveAct, nowMs = Date.now()) {
   return { ...liveAct, liveTokPerSec };
 }
 
+function findSwarmMembersPath(cascadeId) {
+  if (!cascadeId) return '';
+  const normId = String(cascadeId).trim().toLowerCase();
+  if (!UUID_RE.test(normId)) return '';
+  const dirs = Array.isArray(BRAIN_DIRS) && BRAIN_DIRS.length > 0 ? BRAIN_DIRS : [BRAIN_DIR];
+  let bestPath = '';
+  let bestMtime = -1;
+  for (const dir of dirs) {
+    if (!dir) continue;
+    const candidate = join(dir, normId, '.system_generated', 'swarm', 'members.json');
+    if (!existsSync(candidate)) continue;
+    if (dirs.length === 1) return candidate;
+    try {
+      const mtime = Number(statSync(candidate)?.mtimeMs || 0);
+      if (mtime > bestMtime) {
+        bestMtime = mtime;
+        bestPath = candidate;
+      }
+    } catch {
+      if (!bestPath) bestPath = candidate;
+    }
+  }
+  return bestPath;
+}
+
+/**
+ * 按会话 ID 精确读取本地 `brain/<cascadeId>/.system_generated/swarm/members.json` 蜂群花名册（O(1) 定点读取 + `mtimeMs + size` 缓存）。
+ *
+ * @param {string} cascadeId
+ * @returns {{
+ *   title: string,
+ *   coordinator: object|null,
+ *   membersByCid: Map<string, object>,
+ *   membersByName: Map<string, object>,
+ *   workerRefs: Array<object>
+ * } | null}
+ */
+export function readSwarmManifestForCascade(cascadeId) {
+  if (!cascadeId) return null;
+  const normId = String(cascadeId).trim().toLowerCase();
+  if (!UUID_RE.test(normId)) return null;
+  const membersPath = findSwarmMembersPath(normId);
+  if (!membersPath) {
+    swarmManifestMemo.delete(normId);
+    return null;
+  }
+  try {
+    const st = statSync(membersPath);
+    const mtimeMs = Number(st?.mtimeMs || 0);
+    const size = Number(st?.size || 0);
+    const cached = swarmManifestMemo.get(normId);
+    if (
+      cached &&
+      cached.path === membersPath &&
+      cached.mtimeMs === mtimeMs &&
+      cached.size === size &&
+      size > 0
+    ) {
+      return cached.manifest;
+    }
+    const raw = readFileSync(membersPath, 'utf8');
+    const parsed = raw ? JSON.parse(raw) : null;
+    if (!parsed || typeof parsed !== 'object') return null;
+
+    const title = String(parsed.title || '').trim();
+    const rawMembers = parsed.members && typeof parsed.members === 'object' ? parsed.members : {};
+    const membersByCid = new Map();
+    const membersByName = new Map();
+    const workerRefs = [];
+    let coordinator = null;
+
+    for (const [rawKey, m] of Object.entries(rawMembers)) {
+      if (!m || typeof m !== 'object') continue;
+      const memberName = String(m.name || rawKey || '').replace(/^@+/, '').trim();
+      const cid = String(m.conversation_id || m.conversationId || '').trim().toLowerCase();
+      if (!cid || !UUID_RE.test(cid)) continue;
+      const role = String(m.role || '').trim().toLowerCase();
+      const wakeMode = String(m.wake_mode || m.wakeMode || '').trim().toLowerCase();
+      const killed = Boolean(m.killed);
+      const workspaceMode = String(m.workspace_mode || m.workspaceMode || 'inherit').trim();
+      const model = String(m.applied_model || m.model || m.desired_model || '').trim();
+      const entry = {
+        memberName,
+        conversationId: cid,
+        role,
+        wakeMode,
+        killed,
+        workspaceMode,
+        model,
+      };
+      membersByCid.set(cid, entry);
+      if (memberName) {
+        membersByName.set(memberName.toLowerCase(), entry);
+      }
+      if (role === 'coordinator' || cid === normId) {
+        coordinator = entry;
+      } else {
+        workerRefs.push({
+          cascadeId: cid,
+          role: memberName ? `Swarm Worker (${memberName})` : 'Swarm Worker',
+          typeName: 'worker',
+          memberName,
+          createdTimeMs: 0,
+          spawnOrder: null,
+        });
+      }
+    }
+
+    const manifest = { title, coordinator, membersByCid, membersByName, workerRefs };
+    if (swarmManifestMemo.size >= MAX_TRANSCRIPT_MEMO_ENTRIES && !swarmManifestMemo.has(normId)) {
+      const oldestKey = swarmManifestMemo.keys().next().value;
+      if (oldestKey !== undefined) swarmManifestMemo.delete(oldestKey);
+    }
+    swarmManifestMemo.set(normId, { path: membersPath, mtimeMs, size, manifest });
+    return manifest;
+  } catch {
+    return null;
+  }
+}
+
+function findTranscriptPath(cascadeId) {
+  if (!cascadeId) return '';
+  const normId = String(cascadeId).trim().toLowerCase();
+  if (!UUID_RE.test(normId)) return '';
+  const dirs = Array.isArray(BRAIN_DIRS) && BRAIN_DIRS.length > 0 ? BRAIN_DIRS : [BRAIN_DIR];
+  let bestPath = '';
+  let bestMtime = -1;
+  for (const dir of dirs) {
+    if (!dir) continue;
+    const candidate = join(dir, normId, '.system_generated', 'logs', 'transcript.jsonl');
+    if (!existsSync(candidate)) continue;
+    if (dirs.length === 1) return candidate;
+    try {
+      const mtime = Number(statSync(candidate)?.mtimeMs || 0);
+      if (mtime > bestMtime) {
+        bestMtime = mtime;
+        bestPath = candidate;
+      }
+    } catch {
+      if (!bestPath) bestPath = candidate;
+    }
+  }
+  return bestPath;
+}
+
+function inferConversationAppSource(diskFiles = [], extMatch = null) {
+  if (extMatch?.appSource && extMatch.appSource !== 'standalone') {
+    return extMatch.appSource;
+  }
+  for (const filePath of Array.isArray(diskFiles) ? diskFiles : []) {
+    const s = String(filePath || '');
+    if (/[\\/]antigravity-cli(?:[\\/]|$)/i.test(s)) return 'cli';
+    if (/[\\/]antigravity-ide(?:[\\/]|$)/i.test(s)) return 'ide';
+  }
+  return '';
+}
+
+function extractOfflineUserTitle(rawContent) {
+  if (typeof rawContent !== 'string' || !rawContent.trim()) return '';
+  const withoutSummary = rawContent
+    .replace(/<CONTEXT_SUMMARY>[\s\S]*?<\/CONTEXT_SUMMARY>/gi, '')
+    .replace(/<SYSTEM_MESSAGE>[\s\S]*$/i, '');
+  const reqMatches = [...withoutSummary.matchAll(/<USER_REQUEST>([\s\S]*?)<\/USER_REQUEST>/gi)];
+  const body =
+    reqMatches.length > 0
+      ? reqMatches[reqMatches.length - 1][1]
+      : withoutSummary.replace(/<ADDITIONAL_METADATA>[\s\S]*$/i, '');
+  const firstLine = String(body || '')
+    .split(/\r?\n/)
+    .map((l) => l.replace(/\s+/g, ' ').trim())
+    .find(Boolean);
+  if (!firstLine) return '';
+  return firstLine.length > 48 ? `${firstLine.slice(0, 47)}…` : firstLine;
+}
+
+function hasLocalSqliteDb(diskFiles = []) {
+  return Array.isArray(diskFiles) && diskFiles.some((f) => /\.db$/i.test(String(f || '')));
+}
+
+function resolveBestSqliteDbInfo(diskFiles = []) {
+  if (!Array.isArray(diskFiles) || diskFiles.length === 0) return null;
+  let best = null;
+  for (const rawPath of diskFiles) {
+    const p = String(rawPath || '').trim();
+    if (!/\.db$/i.test(p)) continue;
+    const fullPath = /[\\/]|^[a-zA-Z]:/.test(p) ? p : join(CONVERSATIONS_DIR, p);
+    const walInfo = computeSqliteWalSig(fullPath);
+    if (!walInfo.exists) continue;
+    if (!best || walInfo.mtimeMs > best.mtimeMs) {
+      best = {
+        dbPath: fullPath,
+        mtimeMs: walInfo.mtimeMs,
+        sig: walInfo.sig,
+      };
+    }
+  }
+  return best;
+}
+
+function findBestSqliteDbPath(diskFiles = []) {
+  return resolveBestSqliteDbInfo(diskFiles)?.dbPath || '';
+}
+
+function inferAppSourceFromSummary(sourceEnum = '', diskFiles = [], fallback = '') {
+  const fromDisk = inferConversationAppSource(diskFiles, null);
+  if (fromDisk) return fromDisk;
+  const src = String(sourceEnum || '').toUpperCase();
+  if (src.includes('CLI')) return 'cli';
+  if (src.includes('VSCODE') || src.includes('JETBOX') || src.includes('VISUAL_STUDIO')) {
+    return 'ide';
+  }
+  return fallback || 'standalone';
+}
+
+function enrichSqliteStepsFromTranscriptIfNeeded(cidLower, sqliteSteps) {
+  if (!cidLower || !Array.isArray(sqliteSteps) || sqliteSteps.length === 0) {
+    return { firstUserTitle: '' };
+  }
+  const needsTranscriptBackfill = sqliteSteps.some(
+    (s) =>
+      (s?.type === 'CORTEX_STEP_TYPE_USER_INPUT' && !s.userInput) ||
+      (s?.type === 'CORTEX_STEP_TYPE_SYSTEM_MESSAGE' && !s.content && !s.systemMessage) ||
+      (s?.metadata?.modelUsage && !s.metadata.modelUsage.model)
+  );
+  if (!needsTranscriptBackfill) {
+    return { firstUserTitle: '' };
+  }
+  const transcriptPath = findTranscriptPath(cidLower);
+  if (!transcriptPath || !existsSync(transcriptPath)) {
+    return { firstUserTitle: '' };
+  }
+  let raw = '';
+  try {
+    raw = readFileSync(transcriptPath, 'utf8');
+  } catch {
+    return { firstUserTitle: '' };
+  }
+  if (typeof raw !== 'string' || !raw.trim()) {
+    return { firstUserTitle: '' };
+  }
+
+  let firstUserTitle = '';
+  const byStepIdx = new Map();
+  let lineOrdinal = 0;
+  for (const rawLine of raw.split(/\r?\n/)) {
+    const trimmed = rawLine.trim();
+    if (!trimmed) continue;
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (!parsed || typeof parsed !== 'object') continue;
+      const idx = Number.isFinite(Number(parsed.step_index))
+        ? Number(parsed.step_index)
+        : lineOrdinal;
+      lineOrdinal += 1;
+      byStepIdx.set(idx, parsed);
+      const upperType = String(parsed.type || '').trim().toUpperCase();
+      if (
+        !firstUserTitle &&
+        (upperType === 'USER_INPUT' ||
+          upperType === 'CORTEX_STEP_TYPE_USER_INPUT' ||
+          (parsed.userInput && typeof parsed.userInput === 'object'))
+      ) {
+        firstUserTitle = extractOfflineUserTitle(
+          typeof parsed.content === 'string'
+            ? parsed.content
+            : parsed.userInput?.userResponse || ''
+        );
+      }
+    } catch {
+      // 忽略损坏 JSON 行
+    }
+  }
+
+  let maxSqliteIdx = -1;
+  for (const sq of sqliteSteps) {
+    const sIdx = Number(sq?.metadata?.sourceTrajectoryStepInfo?.stepIndex ?? sq?.idx);
+    if (Number.isFinite(sIdx) && sIdx > maxSqliteIdx) maxSqliteIdx = sIdx;
+    const tLine = byStepIdx.get(sIdx);
+    if (!tLine) continue;
+    if (sq.type === 'CORTEX_STEP_TYPE_USER_INPUT' && !sq.userInput) {
+      if (typeof tLine.content === 'string') sq.content = tLine.content;
+      if (tLine.userInput) sq.userInput = tLine.userInput;
+      if (Array.isArray(tLine.media)) sq.media = tLine.media;
+    } else if (
+      sq.type === 'CORTEX_STEP_TYPE_SYSTEM_MESSAGE' &&
+      !sq.content &&
+      typeof tLine.content === 'string'
+    ) {
+      sq.content = tLine.content;
+    } else if (sq.metadata?.modelUsage && !sq.metadata.modelUsage.model) {
+      const fallbackModel = String(tLine.model || tLine.generator_model || '').trim();
+      if (fallbackModel) sq.metadata.modelUsage.model = fallbackModel;
+    }
+  }
+
+  return { firstUserTitle };
+}
+
+function filterClonedTrajectorySteps(rawSteps, generatorMeta, targetCidLower) {
+  if (!targetCidLower) {
+    return { steps: rawSteps || [], generatorMeta: generatorMeta || [] };
+  }
+  const filteredSteps = (rawSteps || []).filter((s) => {
+    const originCid = String(s?.metadata?.sourceTrajectoryStepInfo?.cascadeId || '')
+      .trim()
+      .toLowerCase();
+    return !originCid || originCid === targetCidLower;
+  });
+  const filteredGen = (generatorMeta || []).filter((gm) => {
+    const gmCid = String(gm?.chatModel?.customMetadata?.cascade_id || '')
+      .trim()
+      .toLowerCase();
+    return !gmCid || gmCid === targetCidLower;
+  });
+  return { steps: filteredSteps, generatorMeta: filteredGen };
+}
+
+/**
+ * 当 Language Server RPC 离线或跨端不可达（如 `agy` CLI 独立会话目录）时，优先融合本地 SQLite
+ * (`conversations/<id>.db` + `conversation_summaries.db` + `annotations/<id>.pbtxt`) 与 `transcript.jsonl`
+ * （及可选 `.deep_stats_cache.json`）恢复完整步骤耗时、TTFT、思考/正文拆分、10 通道上下文构成与真实标题。
+ */
+function loadOfflineTranscriptConversation(conv, diskFiles, externalByLower, localSummary = null) {
+  const cidLower = String(conv?.cascadeId || '').trim().toLowerCase();
+  if (!cidLower) return null;
+  const extMatch = externalByLower?.get(cidLower) || null;
+  const sqliteDbPath = findBestSqliteDbPath(diskFiles);
+  const sqliteTraj = sqliteDbPath ? readLocalSqliteTrajectory(sqliteDbPath) : null;
+  const transcriptPath = findTranscriptPath(cidLower);
+
+  const transcriptLines = [];
+  if (transcriptPath && existsSync(transcriptPath)) {
+    try {
+      const raw = readFileSync(transcriptPath, 'utf8');
+      if (typeof raw === 'string' && raw.trim()) {
+        for (const line of raw.split(/\r?\n/)) {
+          const trimmed = line.trim();
+          if (!trimmed) continue;
+          try {
+            const parsed = JSON.parse(trimmed);
+            if (parsed && typeof parsed === 'object') {
+              transcriptLines.push(parsed);
+            }
+          } catch {
+            // 忽略尾部半行或损坏 JSON 行
+          }
+        }
+      }
+    } catch {
+      // 忽略文件读取失败
+    }
+  }
+
+  if (!sqliteTraj && transcriptLines.length === 0 && !extMatch) {
+    return null;
+  }
+
+  let firstUserTitle = '';
+  const transcriptByStepIdx = new Map();
+  for (let rawIdx = 0; rawIdx < transcriptLines.length; rawIdx++) {
+    const line = transcriptLines[rawIdx];
+    const sIdx = Number.isFinite(Number(line.step_index)) ? Number(line.step_index) : rawIdx;
+    transcriptByStepIdx.set(sIdx, line);
+    const upperType = String(line.type || '').trim().toUpperCase();
+    if (
+      !firstUserTitle &&
+      (upperType === 'USER_INPUT' ||
+        upperType === 'CORTEX_STEP_TYPE_USER_INPUT' ||
+        (line.userInput && typeof line.userInput === 'object'))
+    ) {
+      firstUserTitle = extractOfflineUserTitle(
+        typeof line.content === 'string' ? line.content : line.userInput?.userResponse || ''
+      );
+    }
+  }
+
+  let steps = [];
+  let fromSqlite = false;
+
+  if (sqliteTraj && sqliteTraj.steps.length > 0) {
+    fromSqlite = true;
+    const sqliteRawSteps = [];
+    let maxSqliteStepIdx = -1;
+    let modelOrdinal = 0;
+
+    for (const sq of sqliteTraj.steps) {
+      const sIdx = Number(sq.metadata?.sourceTrajectoryStepInfo?.stepIndex ?? sq.idx);
+      if (Number.isFinite(sIdx) && sIdx > maxSqliteStepIdx) {
+        maxSqliteStepIdx = sIdx;
+      }
+      const tLine = transcriptByStepIdx.get(sIdx) || null;
+      if (sq.type === 'CORTEX_STEP_TYPE_USER_INPUT') {
+        sqliteRawSteps.push({
+          type: sq.type,
+          status: sq.status,
+          ...(typeof tLine?.content === 'string' ? { content: tLine.content } : {}),
+          ...(tLine?.userInput ? { userInput: tLine.userInput } : {}),
+          ...(Array.isArray(tLine?.media) ? { media: tLine.media } : {}),
+          metadata: sq.metadata,
+        });
+        continue;
+      }
+      if (sq.type === 'CORTEX_STEP_TYPE_SYSTEM_MESSAGE') {
+        const sysText =
+          typeof sq.content === 'string' && sq.content
+            ? sq.content
+            : typeof tLine?.content === 'string'
+              ? tLine.content
+              : '';
+        if (sysText) {
+          sqliteRawSteps.push({
+            type: sq.type,
+            status: sq.status,
+            content: sysText,
+            metadata: sq.metadata,
+          });
+        }
+        continue;
+      }
+      if (sq.type === 'CORTEX_STEP_TYPE_ERROR_MESSAGE') {
+        sqliteRawSteps.push({
+          type: sq.type,
+          status: sq.status,
+          ...(sq.errorMessage ? { errorMessage: sq.errorMessage } : {}),
+          ...(typeof tLine?.error === 'string' && tLine.error ? { error: tLine.error } : {}),
+          ...(typeof tLine?.content === 'string' && tLine.content ? { content: tLine.content } : {}),
+          metadata: sq.metadata,
+        });
+        continue;
+      }
+
+      const rawUsage = sq.metadata?.modelUsage || sq.metadata?.retryInfos?.[0]?.usage;
+      if (rawUsage) {
+        const deepStep = extMatch?.steps?.[modelOrdinal] || null;
+        modelOrdinal += 1;
+        const mu = { ...rawUsage };
+        if (!mu.model) {
+          const fallbackModel = String(
+            tLine?.model || tLine?.generator_model || deepStep?.modelKey || ''
+          ).trim();
+          if (fallbackModel) mu.model = fallbackModel;
+        }
+        if (!mu.responseModel && (tLine?.response_model || deepStep?.responseModel)) {
+          mu.responseModel = String(tLine?.response_model || deepStep?.responseModel).trim();
+        }
+        sqliteRawSteps.push({
+          type: sq.type,
+          status: sq.status,
+          plannerResponse: {
+            response: typeof tLine?.content === 'string' ? tLine.content : '',
+            thinking: typeof tLine?.thinking === 'string' ? tLine.thinking : '',
+            toolCalls: Array.isArray(tLine?.tool_calls) ? tLine.tool_calls : [],
+          },
+          metadata: {
+            ...sq.metadata,
+            modelUsage: mu,
+          },
+        });
+      }
+    }
+
+    // 补充可能已刷入 transcript.jsonl 但尚未刷入 SQLite 的尾部步骤
+    for (const [sIdx, line] of transcriptByStepIdx.entries()) {
+      if (sIdx <= maxSqliteStepIdx) continue;
+      const upperType = String(line.type || '').trim().toUpperCase();
+      if (
+        upperType === 'USER_INPUT' ||
+        upperType === 'CORTEX_STEP_TYPE_USER_INPUT' ||
+        (line.userInput && typeof line.userInput === 'object') ||
+        upperType === 'SYSTEM_MESSAGE' ||
+        upperType === 'CORTEX_STEP_TYPE_SYSTEM_MESSAGE' ||
+        upperType === 'ERROR_MESSAGE' ||
+        upperType === 'CORTEX_STEP_TYPE_ERROR_MESSAGE'
+      ) {
+        sqliteRawSteps.push(line);
+      } else if (
+        line.input_tokens !== undefined ||
+        line.cache_read_tokens !== undefined ||
+        line.output_tokens !== undefined
+      ) {
+        const tailStatus = String(line.status || '').trim().toUpperCase();
+        sqliteRawSteps.push({
+          type:
+            upperType === 'CHECKPOINT' || upperType === 'CORTEX_STEP_TYPE_CHECKPOINT'
+              ? 'CORTEX_STEP_TYPE_CHECKPOINT'
+              : String(line.type || 'PLANNER_RESPONSE'),
+          status: /CANCEL/.test(tailStatus)
+            ? 'CORTEX_STEP_STATUS_CANCELED'
+            : /ERROR/.test(tailStatus)
+              ? 'CORTEX_STEP_STATUS_ERROR'
+              : /INTERRUPT/.test(tailStatus)
+                ? 'CORTEX_STEP_STATUS_INTERRUPTED'
+                : 'CORTEX_STEP_STATUS_DONE',
+          plannerResponse: {
+            response: typeof line.content === 'string' ? line.content : '',
+            thinking: typeof line.thinking === 'string' ? line.thinking : '',
+            toolCalls: Array.isArray(line.tool_calls) ? line.tool_calls : [],
+          },
+          metadata: {
+            createdAt: String(line.created_at || line.createdAt || ''),
+            sourceTrajectoryStepInfo: { stepIndex: sIdx },
+            modelUsage: {
+              model: String(line.model || line.generator_model || 'unknown').trim() || 'unknown',
+              inputTokens: line.input_tokens ?? 0,
+              cacheReadTokens: line.cache_read_tokens ?? 0,
+              outputTokens: line.output_tokens ?? 0,
+            },
+          },
+        });
+      }
+    }
+
+    steps = extractModelSteps(sqliteRawSteps, sqliteTraj.generatorMetadata || []);
+  }
+
+  if (steps.length === 0 && transcriptLines.length > 0) {
+    const syntheticSteps = [];
+    let modelOrdinal = 0;
+
+    for (let rawIdx = 0; rawIdx < transcriptLines.length; rawIdx++) {
+      const line = transcriptLines[rawIdx];
+      const rawType = String(line.type || '').trim();
+      const upperType = rawType.toUpperCase();
+      if (
+        upperType === 'USER_INPUT' ||
+        upperType === 'CORTEX_STEP_TYPE_USER_INPUT' ||
+        (line.userInput && typeof line.userInput === 'object') ||
+        upperType === 'SYSTEM_MESSAGE' ||
+        upperType === 'CORTEX_STEP_TYPE_SYSTEM_MESSAGE' ||
+        upperType === 'ERROR_MESSAGE' ||
+        upperType === 'CORTEX_STEP_TYPE_ERROR_MESSAGE'
+      ) {
+        syntheticSteps.push(line);
+        continue;
+      }
+
+      if (line.metadata?.modelUsage) {
+        syntheticSteps.push(line);
+        modelOrdinal += 1;
+        continue;
+      }
+
+      const hasTokenCounts =
+        line.input_tokens !== undefined ||
+        line.cache_read_tokens !== undefined ||
+        line.output_tokens !== undefined;
+      if (!hasTokenCounts) continue;
+
+      const deepStep = extMatch?.steps?.[modelOrdinal] || null;
+      modelOrdinal += 1;
+      const isCheckpoint =
+        upperType === 'CHECKPOINT' || upperType === 'CORTEX_STEP_TYPE_CHECKPOINT';
+      const rawStatus = String(line.status || '').trim().toUpperCase();
+      const mappedStatus = /CANCEL/.test(rawStatus)
+        ? 'CORTEX_STEP_STATUS_CANCELED'
+        : /ERROR/.test(rawStatus)
+          ? 'CORTEX_STEP_STATUS_ERROR'
+          : /INTERRUPT/.test(rawStatus)
+            ? 'CORTEX_STEP_STATUS_INTERRUPTED'
+            : 'CORTEX_STEP_STATUS_DONE';
+      const finishedAt = String(
+        line.finished_generating_at ||
+          line.finishedGeneratingAt ||
+          line.completed_at ||
+          line.completedAt ||
+          ''
+      ).trim();
+      const modelKey =
+        String(line.model || line.generator_model || deepStep?.modelKey || 'unknown').trim() ||
+        'unknown';
+      const responseModel = String(line.response_model || deepStep?.responseModel || '').trim();
+      const apiProvider = String(line.api_provider || deepStep?.apiProvider || '').trim();
+      const modelDisplayName = String(
+        line.model_display_name || deepStep?.modelDisplayName || ''
+      ).trim();
+      const thinkingTokens = Number(line.thinking_tokens ?? deepStep?.thinkingTokens ?? 0) || 0;
+      const responseTokens = line.response_tokens ?? deepStep?.responseTokens;
+
+      syntheticSteps.push({
+        type: isCheckpoint ? 'CORTEX_STEP_TYPE_CHECKPOINT' : rawType || 'PLANNER_RESPONSE',
+        status: mappedStatus,
+        plannerResponse: {
+          response: typeof line.content === 'string' ? line.content : '',
+          thinking: typeof line.thinking === 'string' ? line.thinking : '',
+          toolCalls: Array.isArray(line.tool_calls) ? line.tool_calls : [],
+          ...(thinkingTokens > 0 ? { thinkingTokens } : {}),
+          ...(responseTokens !== undefined ? { responseTokens } : {}),
+        },
+        metadata: {
+          createdAt: String(line.created_at || line.createdAt || deepStep?.createdAt || ''),
+          ...(finishedAt ? { finishedGeneratingAt: finishedAt } : {}),
+          sourceTrajectoryStepInfo: {
+            stepIndex: Number.isFinite(Number(line.step_index)) ? Number(line.step_index) : rawIdx,
+          },
+          modelUsage: {
+            model: modelKey,
+            ...(responseModel ? { responseModel } : {}),
+            ...(apiProvider ? { apiProvider } : {}),
+            inputTokens: line.input_tokens ?? deepStep?.inputTokens ?? 0,
+            cacheReadTokens: line.cache_read_tokens ?? deepStep?.cacheReadTokens ?? 0,
+            outputTokens: line.output_tokens ?? deepStep?.outputTokens ?? 0,
+            ...(thinkingTokens > 0 ? { thinkingOutputTokens: thinkingTokens } : {}),
+            ...(responseTokens !== undefined ? { responseOutputTokens: responseTokens } : {}),
+          },
+          ...(modelDisplayName
+            ? { generatorMetadata: [{ chatModel: { modelDisplayName } }] }
+            : {}),
+        },
+      });
+    }
+
+    steps = syntheticSteps.length > 0 ? extractModelSteps(syntheticSteps, []) : [];
+  }
+
+  if (steps.length === 0 && Array.isArray(extMatch?.steps) && extMatch.steps.length > 0) {
+    const extSynthetic = extMatch.steps.map((ds, idx) => ({
+      type: 'PLANNER_RESPONSE',
+      status: 'CORTEX_STEP_STATUS_DONE',
+      plannerResponse: {
+        ...(ds.thinkingTokens > 0 ? { thinkingTokens: ds.thinkingTokens } : {}),
+        ...(ds.responseTokens !== undefined ? { responseTokens: ds.responseTokens } : {}),
+      },
+      metadata: {
+        createdAt: ds.createdAt || '',
+        sourceTrajectoryStepInfo: { stepIndex: ds.stepIndex ?? idx + 1 },
+        modelUsage: {
+          model: ds.modelKey || 'unknown',
+          ...(ds.responseModel ? { responseModel: ds.responseModel } : {}),
+          ...(ds.apiProvider ? { apiProvider: ds.apiProvider } : {}),
+          inputTokens: ds.inputTokens || 0,
+          cacheReadTokens: ds.cacheReadTokens || 0,
+          outputTokens: ds.outputTokens || 0,
+          ...(ds.thinkingTokens > 0 ? { thinkingOutputTokens: ds.thinkingTokens } : {}),
+          ...(ds.responseTokens !== undefined
+            ? { responseOutputTokens: ds.responseTokens }
+            : {}),
+        },
+        ...(ds.modelDisplayName
+          ? { generatorMetadata: [{ chatModel: { modelDisplayName: ds.modelDisplayName } }] }
+          : {}),
+      },
+    }));
+    steps = extractModelSteps(extSynthetic, []);
+  }
+
+  const defaultShortId = cidLower.slice(0, 8);
+  const nonShortTitle = (t) => {
+    const clean = String(t || '').trim();
+    return clean && clean.toLowerCase() !== defaultShortId ? clean : '';
+  };
+  const annotationTitle = nonShortTitle(readAnnotationTitleForCascade(cidLower));
+  const summaryTitle = nonShortTitle(localSummary?.title);
+  const currentTitle = nonShortTitle(conv.title);
+  const extTitle = nonShortTitle(extMatch?.title);
+  const resolvedTitle =
+    annotationTitle ||
+    summaryTitle ||
+    currentTitle ||
+    extTitle ||
+    firstUserTitle ||
+    String(conv.title || '').trim() ||
+    conv.cascadeId.slice(0, 8);
+
+  const parentConversationId = String(
+    localSummary?.parentConversationId ||
+      sqliteTraj?.parentConversationId ||
+      conv.parentConversationId ||
+      ''
+  )
+    .trim()
+    .toLowerCase();
+  const rawRootCid = String(sqliteTraj?.rootConversationId || conv.rootConversationId || '')
+    .trim()
+    .toLowerCase();
+  const rootConversationId =
+    rawRootCid && rawRootCid !== cidLower ? rawRootCid : parentConversationId;
+
+  const lastStepMs = steps[steps.length - 1]?.createdAtMs || 0;
+  return {
+    steps,
+    fromSqlite,
+    title: resolvedTitle,
+    accountName: extMatch?.accountName || '',
+    appSource: inferConversationAppSource(diskFiles, extMatch),
+    parentConversationId,
+    rootConversationId,
+    lastModifiedMs: Math.max(
+      conv.lastModifiedMs || 0,
+      localSummary?.lastModifiedMs || 0,
+      extMatch?.lastModifiedMs || 0,
+      lastStepMs
+    ),
+    subagentRefs: [],
+  };
+}
+
 /**
  * 读取指定会话在本地 `brain/<cascadeId>/.system_generated/logs/transcript.jsonl` 的尾部步骤。
  * 采用 `mtimeMs + size` 签名缓存与尾部 96KB 定长切片读取，避免长会话大文件全量读取阻塞事件循环。
@@ -269,20 +1143,20 @@ function readTranscriptTailSteps(cascadeId, maxLines = 24) {
   if (!cascadeId) return [];
   const normId = String(cascadeId).trim().toLowerCase();
   if (!UUID_RE.test(normId)) return [];
-  const transcriptPath = join(
-    BRAIN_DIR,
-    normId,
-    '.system_generated',
-    'logs',
-    'transcript.jsonl'
-  );
-  if (!existsSync(transcriptPath)) return [];
+  const transcriptPath = findTranscriptPath(normId);
+  if (!transcriptPath) return [];
   try {
     const st = statSync(transcriptPath);
     const mtimeMs = Number(st?.mtimeMs || 0);
     const size = Number(st?.size || 0);
     const cached = transcriptTailMemo.get(normId);
-    if (cached && cached.mtimeMs === mtimeMs && cached.size === size && size > 0) {
+    if (
+      cached &&
+      cached.path === transcriptPath &&
+      cached.mtimeMs === mtimeMs &&
+      cached.size === size &&
+      size > 0
+    ) {
       return cached.steps;
     }
 
@@ -323,7 +1197,7 @@ function readTranscriptTailSteps(cascadeId, maxLines = 24) {
     }
 
     if (typeof raw !== 'string' || !raw.trim()) {
-      transcriptTailMemo.set(normId, { mtimeMs, size, steps: [] });
+      transcriptTailMemo.set(normId, { path: transcriptPath, mtimeMs, size, steps: [] });
       return [];
     }
     const lines = raw.trim().split(/\r?\n/);
@@ -345,7 +1219,7 @@ function readTranscriptTailSteps(cascadeId, maxLines = 24) {
       const oldestKey = transcriptTailMemo.keys().next().value;
       if (oldestKey !== undefined) transcriptTailMemo.delete(oldestKey);
     }
-    transcriptTailMemo.set(normId, { mtimeMs, size, steps });
+    transcriptTailMemo.set(normId, { path: transcriptPath, mtimeMs, size, steps });
     return steps;
   } catch {
     return [];
@@ -384,8 +1258,7 @@ function scoreLiveActivitySpecificity(act) {
 
 function resolveBestLiveActivity(cascadeId, rpcRawSteps, isRunning, fallbackMs) {
   if (!isRunning) {
-    attachLiveStreamSpeed(cascadeId, null);
-    return null;
+    return attachLiveStreamSpeed(cascadeId, null);
   }
   const hasRpcSteps = Array.isArray(rpcRawSteps) && rpcRawSteps.length > 0;
   const rpcAct = hasRpcSteps ? extractLiveActivity(rpcRawSteps, true, fallbackMs) : null;
@@ -415,15 +1288,6 @@ function resolveBestLiveActivity(cascadeId, rpcRawSteps, isRunning, fallbackMs) 
         } else {
           chosen = transcriptAct;
         }
-      }
-      // 同一步流式生成中，优先取 RPC 与 transcript 两者中更新的估算 Token 数，避免落盘延迟拉低实时速率
-      if (
-        chosen &&
-        rpcAct.liveStepKey &&
-        chosen.liveStepKey === rpcAct.liveStepKey &&
-        Number(rpcAct.liveEstTokens || 0) > Number(chosen.liveEstTokens || 0)
-      ) {
-        chosen = { ...chosen, liveEstTokens: rpcAct.liveEstTokens };
       }
     }
   } else {
@@ -574,7 +1438,7 @@ function extractTrajectorySubagentMeta(trajRes, fallback = {}) {
  *
  * @param {{
  *   summariesObj?: Record<string, object>,
- *   currentAccountName?: string,
+ *   currentAccountName?: string|null,
  *   requestedConvId?: string,
  *   forceRefresh?: boolean
  * }} params
@@ -586,6 +1450,7 @@ function extractTrajectorySubagentMeta(trajRes, fallback = {}) {
  */
 export async function enumerateAndSyncConversations({
   summariesObj = {},
+  sideQuestionParents = {},
   currentAccountName = '',
   requestedConvId = '',
   forceRefresh = false,
@@ -603,10 +1468,11 @@ export async function enumerateAndSyncConversations({
     }
   }
 
-  let cacheDirty = cacheState.needsSave;
+  let cacheDirty = hasPendingTrajectoryCacheSave();
   const diskConvMap = discoverLocalConversationFiles();
 
   // 构建大小写不敏感索引，将同一会话的不同大小写键合并至唯一规范键（优先保留 summariesObj 中的原始键以兼容 RPC）
+  const mergedSideQuestionParents = { ...(sideQuestionParents || {}) };
   const canonicalIdByLower = new Map();
   const summariesByLower = new Map();
   for (const [rawId, summary] of Object.entries(summariesObj || {})) {
@@ -614,9 +1480,45 @@ export async function enumerateAndSyncConversations({
     if (!lower) continue;
     canonicalIdByLower.set(lower, rawId);
     summariesByLower.set(lower, summary);
+
+    const sqIds = summary?.annotations?.sideQuestionCascadeIds;
+    const sqTitles = summary?.annotations?.sideQuestionTitles || {};
+    if (Array.isArray(sqIds)) {
+      for (const sqId of sqIds) {
+        const sqLower = String(sqId || '').trim().toLowerCase();
+        if (!sqLower) continue;
+        mergedSideQuestionParents[sqLower] = {
+          parentConversationId: lower,
+          title: String(sqTitles[sqLower] || mergedSideQuestionParents[sqLower]?.title || ''),
+        };
+      }
+    }
+    if (sqTitles && typeof sqTitles === 'object') {
+      for (const [sqKey, sqTitle] of Object.entries(sqTitles)) {
+        const sqLower = String(sqKey || '').trim().toLowerCase();
+        if (!sqLower) continue;
+        const prevSq = mergedSideQuestionParents[sqLower];
+        mergedSideQuestionParents[sqLower] = {
+          parentConversationId: prevSq?.parentConversationId || lower,
+          title: String(sqTitle || prevSq?.title || ''),
+        };
+      }
+    }
+    const isSummarySideQ =
+      Boolean(summary?.isSideQuestion) ||
+      Number(summary?.trajectoryType) === 22 ||
+      summary?.trajectoryType === 'CORTEX_TRAJECTORY_TYPE_SIDE_QUESTION';
+    const forkParent = String(summary?.forkParentConversationId || '').trim().toLowerCase();
+    if (isSummarySideQ && forkParent) {
+      const prevSq = mergedSideQuestionParents[lower];
+      mergedSideQuestionParents[lower] = {
+        parentConversationId: prevSq?.parentConversationId || forkParent,
+        title: String(prevSq?.title || summary?.annotations?.title || ''),
+      };
+    }
   }
 
-  for (const rawCacheKey of Object.keys(trajectoryCache)) {
+  for (const [rawCacheKey] of listCachedTrajectoryEntries()) {
     const lower = String(rawCacheKey || '').trim().toLowerCase();
     if (!lower) continue;
     const existingCanon = canonicalIdByLower.get(lower);
@@ -624,18 +1526,18 @@ export async function enumerateAndSyncConversations({
       // 标准 UUID 统一收敛为小写键，避免大小写分裂产生双份条目
       const normalizedKey = UUID_RE.test(rawCacheKey) ? lower : rawCacheKey;
       if (normalizedKey !== rawCacheKey) {
-        trajectoryCache[normalizedKey] = trajectoryCache[rawCacheKey];
-        delete trajectoryCache[rawCacheKey];
+        setCachedTrajectory(normalizedKey, getCachedTrajectory(rawCacheKey));
+        removeCachedTrajectory(rawCacheKey);
         cacheDirty = true;
       }
       canonicalIdByLower.set(lower, normalizedKey);
     } else if (existingCanon !== rawCacheKey) {
-      const targetEntry = trajectoryCache[existingCanon];
-      const dupEntry = trajectoryCache[rawCacheKey];
+      const targetEntry = getCachedTrajectory(existingCanon);
+      const dupEntry = getCachedTrajectory(rawCacheKey);
       if (!targetEntry || (dupEntry?.steps?.length || 0) > (targetEntry?.steps?.length || 0)) {
-        trajectoryCache[existingCanon] = dupEntry;
+        setCachedTrajectory(existingCanon, dupEntry);
       }
-      delete trajectoryCache[rawCacheKey];
+      removeCachedTrajectory(rawCacheKey);
       cacheDirty = true;
     }
   }
@@ -646,17 +1548,8 @@ export async function enumerateAndSyncConversations({
     }
   }
 
-  // 仅从归属于当前账号的缓存会话收集 subagentRefs，防止跨账号切换时将其他账号的子代理复活进当前会话列表
-  for (const [cacheKey, entry] of Object.entries(trajectoryCache)) {
-    const cacheKeyLower = String(cacheKey || '').toLowerCase();
-    if (
-      entry?.accountName &&
-      currentAccountName &&
-      entry.accountName !== currentAccountName &&
-      !summariesByLower.has(cacheKeyLower)
-    ) {
-      continue;
-    }
+  // 从所有本地缓存会话收集 subagentRefs，确保跨账号切换时历史会话与派生子代理均不丢失
+  for (const [, entry] of listCachedTrajectoryEntries()) {
     for (const ref of entry?.subagentRefs || []) {
       const refCid = String(ref?.cascadeId || '').trim().toLowerCase();
       if (refCid && !canonicalIdByLower.has(refCid)) {
@@ -665,57 +1558,131 @@ export async function enumerateAndSyncConversations({
     }
   }
 
+  const localSummaryByLower = readLocalSummaryIndex();
+  const sqliteAvailable = hasBuiltinNodeSqlite();
+  const STALE_LOCAL_RUNNING_MAX_AGE_MS = 10 * 60_000;
   const reqLower = String(requestedConvId || '').trim().toLowerCase();
   const rawConversations = [];
   for (const [cidLower, cascadeId] of canonicalIdByLower.entries()) {
     const item = summariesByLower.get(cidLower);
-    const cached = trajectoryCache[cascadeId];
-    if (
-      cached?.accountName &&
-      currentAccountName &&
-      cached.accountName !== currentAccountName &&
-      !item
-    ) {
-      continue;
-    }
-    const diskMtimeMs = diskConvMap.get(cidLower) || 0;
+    const localSum = item ? null : localSummaryByLower.get(cidLower) || null;
+    const cached = getCachedTrajectory(cascadeId);
+    const diskFiles = diskConvMap.get(cidLower) || [];
+    const sqliteDbInfo = sqliteAvailable ? resolveBestSqliteDbInfo(diskFiles) : null;
+    const dbPath = sqliteDbInfo?.dbPath || '';
+    const diskFileSig = sqliteDbInfo?.sig || '';
+    const lastModifiedTime = item?.lastModifiedTime || item?.createdTime || '';
+    const summaryMtimeMs = parseIsoMs(lastModifiedTime);
+    const rawDiskMtimeMs = summaryMtimeMs ? null : readConversationMtime(diskFiles);
+    const diskMtimeMs = sqliteDbInfo
+      ? Math.max(rawDiskMtimeMs || 0, sqliteDbInfo.mtimeMs || 0)
+      : rawDiskMtimeMs;
+    const appSource = inferAppSourceFromSummary(
+      item?.source || '',
+      diskFiles,
+      cached?.appSource || 'standalone'
+    );
+
+    const sqParentInfo = mergedSideQuestionParents[cidLower] || null;
+    const isSideQuestion = Boolean(
+      sqParentInfo ||
+        item?.isSideQuestion ||
+        Number(item?.trajectoryType) === 22 ||
+        item?.trajectoryType === 'CORTEX_TRAJECTORY_TYPE_SIDE_QUESTION' ||
+        localSum?.isSideQuestion ||
+        Number(localSum?.trajectoryType) === 22 ||
+        cached?.isSideQuestion ||
+        cached?.subagentSpec?.typeName === 'side_question'
+    );
+
     const rawMeta = item?.trajectoryMetadata || item?.metadata || {};
     const parentConversationId = String(
-      rawMeta.parentConversationId || cached?.parentConversationId || ''
+      rawMeta.parentConversationId ||
+        sqParentInfo?.parentConversationId ||
+        item?.forkParentConversationId ||
+        localSum?.parentConversationId ||
+        localSum?.forkParentConversationId ||
+        cached?.parentConversationId ||
+        cached?.parentCascadeId ||
+        ''
     ).toLowerCase();
-    const rootConversationId = String(
-      rawMeta.rootConversationId || cached?.rootConversationId || parentConversationId || ''
-    ).toLowerCase();
-    const subagentSpec = mergeSubagentSpecs(rawMeta.subagentSpec, cached?.subagentSpec);
+    const rawRootCid = String(
+      rawMeta.rootConversationId || localSum?.rootConversationId || ''
+    )
+      .trim()
+      .toLowerCase();
+    const cachedRootCid = String(cached?.rootConversationId || '').trim().toLowerCase();
+    const rootConversationId =
+      (rawRootCid && rawRootCid !== cidLower ? rawRootCid : '') ||
+      (cachedRootCid && cachedRootCid !== cidLower ? cachedRootCid : '') ||
+      parentConversationId ||
+      '';
+    const localAgentSpec =
+      parentConversationId && (localSum?.subagentSpec || localSum?.agentName)
+        ? localSum.subagentSpec || { role: localSum.agentName }
+        : null;
+    const primarySpec = isSideQuestion
+      ? {
+          typeName: 'side_question',
+          role: String(sqParentInfo?.title || item?.annotations?.title || localSum?.title || '').trim(),
+        }
+      : rawMeta.subagentSpec;
+    const subagentSpec = mergeSubagentSpecs(
+      primarySpec,
+      mergeSubagentSpecs(localAgentSpec, cached?.subagentSpec)
+    );
     const agentScriptName = rawMeta.agentScript?.name || cached?.agentScriptName || '';
     const createdTimeMs =
-      parseIsoMs(item?.createdTime || rawMeta?.createdAt) || cached?.createdTimeMs || 0;
+      parseIsoMs(item?.createdTime || rawMeta?.createdAt || localSum?.createdTime) ||
+      cached?.createdTimeMs ||
+      0;
     const spawnOrder = Number.isFinite(cached?.spawnOrder) ? cached.spawnOrder : null;
     const subagentRefs = Array.isArray(cached?.subagentRefs) ? cached.subagentRefs : null;
     const isSubagent =
+      isSideQuestion ||
+      Boolean(cached?.isSubagent) ||
       Boolean(parentConversationId) ||
       Boolean(rootConversationId && rootConversationId !== cidLower);
+    const isKilled = Boolean(item?.killed || localSum?.killed);
+    const latestLocalTouchMs = Math.max(diskMtimeMs || 0, localSum?.lastModifiedMs || 0);
+    const localStatus =
+      !isKilled &&
+      localSum?.status === 'CASCADE_RUN_STATUS_RUNNING' &&
+      latestLocalTouchMs > 0 &&
+      nowSweepMs - latestLocalTouchMs <= STALE_LOCAL_RUNNING_MAX_AGE_MS
+        ? 'CASCADE_RUN_STATUS_RUNNING'
+        : 'IDLE';
 
     if (item) {
-      const lastModifiedTime = item?.lastModifiedTime || item?.createdTime || '';
       const lastModifiedMs =
-        parseIsoMs(lastModifiedTime) || diskMtimeMs || cached?.lastModifiedMs || 0;
+        summaryMtimeMs || diskMtimeMs || cached?.lastModifiedMs || 0;
       const rawSummaryStepCount = Number(item?.stepCount || 0);
       const modelStepCount = Array.isArray(cached?.steps)
         ? cached.steps.length
-        : rawSummaryStepCount;
+        : isSideQuestion
+          ? 0
+          : rawSummaryStepCount;
       rawConversations.push({
         cascadeId,
         title:
-          item?.annotations?.title || item?.summary || cached?.title || cascadeId.slice(0, 8),
+          sqParentInfo?.title ||
+          item?.annotations?.title ||
+          item?.summary ||
+          cached?.title ||
+          (isSideQuestion ? '旁路提问' : cascadeId.slice(0, 8)),
         stepCount: modelStepCount,
         rawStepCount: rawSummaryStepCount,
-        status: item?.status || '',
+        status: isKilled ? 'IDLE' : item?.status || '',
+        killed: isKilled,
         lastModifiedTime,
         lastModifiedMs,
         diskMtimeMs,
+        dbPath,
+        diskFileSig,
+        appSource,
         inSummaries: true,
         isSubagent,
+        isSideQuestion,
         parentConversationId,
         rootConversationId,
         subagentSpec,
@@ -729,15 +1696,29 @@ export async function enumerateAndSyncConversations({
       const cachedStepCount = Number(cached.steps?.length || 0);
       rawConversations.push({
         cascadeId,
-        title: cached.title || cascadeId.slice(0, 8),
+        title:
+          sqParentInfo?.title ||
+          localSum?.title ||
+          cached.title ||
+          (isSideQuestion ? '旁路提问' : cascadeId.slice(0, 8)),
         stepCount: cachedStepCount,
-        rawStepCount: cachedStepCount,
-        status: 'IDLE',
-        lastModifiedTime: '',
-        lastModifiedMs: Math.max(cached.lastModifiedMs || 0, lastStepMs, diskMtimeMs),
+        rawStepCount: localSum?.stepCount || cached.rawStepCount || cachedStepCount,
+        status: localStatus,
+        killed: isKilled,
+        lastModifiedTime: localSum?.lastModifiedTime || '',
+        lastModifiedMs: Math.max(
+          cached.lastModifiedMs || 0,
+          lastStepMs,
+          diskMtimeMs || 0,
+          localSum?.lastModifiedMs || 0
+        ),
         diskMtimeMs,
+        dbPath,
+        diskFileSig,
+        appSource,
         inSummaries: false,
         isSubagent,
+        isSideQuestion,
         parentConversationId,
         rootConversationId,
         subagentSpec,
@@ -749,21 +1730,29 @@ export async function enumerateAndSyncConversations({
     } else {
       rawConversations.push({
         cascadeId,
-        title: cascadeId.slice(0, 8),
+        title:
+          sqParentInfo?.title ||
+          localSum?.title ||
+          (isSideQuestion ? '旁路提问' : cascadeId.slice(0, 8)),
         stepCount: 0,
-        rawStepCount: 0,
-        status: 'IDLE',
-        lastModifiedTime: '',
-        lastModifiedMs: diskMtimeMs,
+        rawStepCount: localSum?.stepCount || 0,
+        status: localStatus,
+        killed: isKilled,
+        lastModifiedTime: localSum?.lastModifiedTime || '',
+        lastModifiedMs: Math.max(diskMtimeMs || 0, localSum?.lastModifiedMs || 0),
         diskMtimeMs,
+        dbPath,
+        diskFileSig,
+        appSource,
         inSummaries: false,
         needsInitialLoad: true,
-        isSubagent: false,
-        parentConversationId: '',
-        rootConversationId: '',
-        subagentSpec: null,
-        agentScriptName: '',
-        createdTimeMs: 0,
+        isSubagent,
+        isSideQuestion,
+        parentConversationId,
+        rootConversationId,
+        subagentSpec,
+        agentScriptName,
+        createdTimeMs,
         spawnOrder: null,
         subagentRefs: null,
       });
@@ -776,6 +1765,9 @@ export async function enumerateAndSyncConversations({
   const nowPollMs = Date.now();
 
   function buildConvSig(conv) {
+    if (conv.dbPath && conv.diskFileSig && sqliteAvailable) {
+      return `${CACHE_SCHEMA_VERSION}:sqlite:${conv.rawStepCount ?? conv.stepCount}:${conv.lastModifiedTime || ''}:${conv.diskFileSig}`;
+    }
     return conv.inSummaries
       ? `${CACHE_SCHEMA_VERSION}:${conv.rawStepCount ?? conv.stepCount}:${conv.lastModifiedTime}`
       : `${CACHE_SCHEMA_VERSION}:disk:${Math.floor(conv.diskMtimeMs || conv.lastModifiedMs || 0)}`;
@@ -805,19 +1797,33 @@ export async function enumerateAndSyncConversations({
     if (!Object.prototype.hasOwnProperty.call(lastCachedStep, 'contextBreakdown')) {
       return true;
     }
-    if (steps.some((s) => !Object.prototype.hasOwnProperty.call(s, 'responseModel'))) {
-      return true;
-    }
+    const { missingResponseModel, missingToolResultsTokens } = readStepFieldChecks(steps);
+    return missingResponseModel || missingToolResultsTokens;
+  }
+
+  function readStepFieldChecks(steps) {
+    const known = stepFieldChecks.get(steps);
+    if (known) return known;
+    let missingToolResultsTokens = false;
     for (let i = steps.length - 1; i >= 0; i--) {
       if (steps[i]?.contextBreakdown) {
-        return !Object.prototype.hasOwnProperty.call(
+        missingToolResultsTokens = !Object.prototype.hasOwnProperty.call(
           steps[i].contextBreakdown,
           'toolResultsTokens'
         );
+        break;
       }
     }
-    return false;
+    const checks = {
+      missingResponseModel: steps.some((s) => !Object.prototype.hasOwnProperty.call(s, 'responseModel')),
+      missingToolResultsTokens,
+      hasIncompleteTiming: steps.some((s) => s.speedReason === 'incomplete_or_invalid_timing'),
+    };
+    stepFieldChecks.set(steps, checks);
+    return checks;
   }
+
+  let lazyExternalByLower = null;
 
   /**
    * 批量拉取会话轨迹并提取步骤、子代理元数据 (`trajectory.metadata`) 与子代理调用引用 (`invokeSubagent`)。
@@ -836,75 +1842,208 @@ export async function enumerateAndSyncConversations({
           const cooldownKey = `${conv.cascadeId.toLowerCase()}::${sig}`;
           const isRunning = conv.status === 'CASCADE_RUN_STATUS_RUNNING';
           const isReq = Boolean(reqLower && conv.cascadeId.toLowerCase() === reqLower);
-          const prev = trajectoryCache[conv.cascadeId];
+          const prev = getCachedTrajectory(conv.cascadeId);
           let partialTailSteps = [];
           let hasTailStepInfo = false;
           try {
-            const trajRes = await callLsRpc('GetCascadeTrajectory', { cascadeId: conv.cascadeId });
+            const cidLower = conv.cascadeId.toLowerCase();
+            let trajRes = null;
+            let loadedViaSqlite = false;
+            let transcriptFirstTitle = '';
+            if (conv.dbPath && sqliteAvailable) {
+              const sqlRes = readLocalSqliteTrajectory(conv.dbPath, {
+                cascadeId: conv.cascadeId,
+                isRunning,
+              });
+              if (sqlRes && Array.isArray(sqlRes.trajectory?.steps)) {
+                trajRes = sqlRes;
+                loadedViaSqlite = true;
+                const enriched = enrichSqliteStepsFromTranscriptIfNeeded(
+                  cidLower,
+                  trajRes.trajectory.steps
+                );
+                transcriptFirstTitle = enriched.firstUserTitle || '';
+              }
+            }
+            if (!trajRes) {
+              trajRes = await callLsRpc('GetCascadeTrajectory', { cascadeId: conv.cascadeId });
+            }
             if (!Array.isArray(trajRes?.trajectory?.steps)) {
               throw new Error('Trajectory steps unavailable');
             }
-            const rawSteps = trajRes.trajectory.steps;
-            if (Number(trajRes.numTotalSteps) > rawSteps.length) {
-              if (rawSteps.length > 0) {
-                partialTailSteps = rawSteps;
+            const rawStepsUnfiltered = trajRes.trajectory.steps;
+            if (!loadedViaSqlite && Number(trajRes.numTotalSteps) > rawStepsUnfiltered.length) {
+              if (rawStepsUnfiltered.length > 0) {
+                partialTailSteps = rawStepsUnfiltered;
                 const tailIdx =
-                  rawSteps[rawSteps.length - 1]?.metadata?.sourceTrajectoryStepInfo?.stepIndex;
+                  rawStepsUnfiltered[rawStepsUnfiltered.length - 1]?.metadata?.sourceTrajectoryStepInfo
+                    ?.stepIndex;
                 hasTailStepInfo = Number.isFinite(Number(tailIdx));
               }
               throw new Error('Incomplete trajectory; retaining cached usage');
             }
             failedFetchCooldownMap.delete(cooldownKey);
-            const generatorMeta = trajRes?.trajectory?.generatorMetadata || [];
+            const rawGenMeta = trajRes?.trajectory?.generatorMetadata || [];
+            const { steps: rawSteps, generatorMeta } = loadedViaSqlite
+              ? { steps: rawStepsUnfiltered, generatorMeta: rawGenMeta }
+              : filterClonedTrajectorySteps(rawStepsUnfiltered, rawGenMeta, cidLower);
             const steps = extractModelSteps(rawSteps, generatorMeta);
             const nextLast = steps[steps.length - 1];
 
-            // 提取轨迹内携带的子代理归属元数据与派生的子代理引用列表
+            // 提取轨迹内携带的子代理归属元数据、旁路提问父归属与派生的子代理引用列表
+            const sqParentInfo = mergedSideQuestionParents[cidLower] || null;
             const extractedMeta = extractTrajectorySubagentMeta(trajRes, conv);
-            conv.parentConversationId = extractedMeta.parentConversationId;
-            conv.rootConversationId = extractedMeta.rootConversationId;
-            conv.subagentSpec = extractedMeta.subagentSpec;
-            conv.agentScriptName = extractedMeta.agentScriptName;
-            conv.createdTimeMs = extractedMeta.createdTimeMs;
-            conv.isSubagent =
-              Boolean(conv.parentConversationId) ||
-              Boolean(
-                conv.rootConversationId &&
-                  conv.rootConversationId !== conv.cascadeId.toLowerCase()
-              );
+            const detectedSideQuestion = Boolean(
+              trajRes?.isSideQuestion ||
+                Number(trajRes?.trajectoryType) === 22 ||
+                trajRes?.trajectoryType === 'CORTEX_TRAJECTORY_TYPE_SIDE_QUESTION' ||
+                conv.isSideQuestion ||
+                sqParentInfo
+            );
+            const defaultShortId = cidLower.slice(0, 8);
+            const nonShortTitle = (t) => {
+              const clean = String(t || '').trim();
+              return clean && clean.toLowerCase() !== defaultShortId ? clean : '';
+            };
+
+            if (detectedSideQuestion) {
+              const parentCid = String(
+                sqParentInfo?.parentConversationId ||
+                  trajRes?.forkParentConversationId ||
+                  extractedMeta.parentConversationId ||
+                  conv.parentConversationId ||
+                  ''
+              )
+                .trim()
+                .toLowerCase();
+              const sqTitle = String(
+                sqParentInfo?.title ||
+                  trajRes?.firstOwnUserPrompt ||
+                  transcriptFirstTitle ||
+                  (prev?.isSideQuestion ? nonShortTitle(prev?.title) : '') ||
+                  nonShortTitle(conv.title) ||
+                  ''
+              ).trim();
+              const cleanSqRole = sqTitle && sqTitle !== '旁路提问' ? sqTitle : '';
+              conv.isSideQuestion = true;
+              conv.parentConversationId = parentCid;
+              const extRoot = String(extractedMeta.rootConversationId || '').trim().toLowerCase();
+              const prevConvRoot = String(conv.rootConversationId || '').trim().toLowerCase();
+              conv.rootConversationId =
+                (extRoot && extRoot !== cidLower ? extRoot : '') ||
+                (prevConvRoot && prevConvRoot !== cidLower ? prevConvRoot : '') ||
+                parentCid ||
+                '';
+              conv.title = cleanSqRole || '旁路提问';
+              conv.subagentSpec = {
+                typeName: 'side_question',
+                role: cleanSqRole || '旁路提问',
+              };
+              conv.agentScriptName = '';
+              conv.createdTimeMs =
+                extractedMeta.createdTimeMs || steps[0]?.createdAtMs || conv.createdTimeMs || 0;
+              conv.isSubagent = Boolean(conv.parentConversationId || conv.rootConversationId);
+            } else {
+              conv.parentConversationId = extractedMeta.parentConversationId;
+              conv.rootConversationId = extractedMeta.rootConversationId;
+              conv.subagentSpec = extractedMeta.subagentSpec;
+              conv.agentScriptName = extractedMeta.agentScriptName;
+              conv.createdTimeMs = extractedMeta.createdTimeMs;
+              conv.isSubagent =
+                Boolean(conv.parentConversationId) ||
+                Boolean(
+                  conv.rootConversationId && conv.rootConversationId !== cidLower
+                );
+              if (!nonShortTitle(conv.title)) {
+                const annTitle = nonShortTitle(readAnnotationTitleForCascade(cidLower));
+                const resolvedFallbackTitle =
+                  annTitle || trajRes?.firstOwnUserPrompt || transcriptFirstTitle;
+                if (resolvedFallbackTitle) {
+                  conv.title = resolvedFallbackTitle;
+                }
+              }
+            }
+            if (loadedViaSqlite && Number.isFinite(trajRes?.rawTableStepCount) && !conv.inSummaries) {
+              conv.rawStepCount = trajRes.rawTableStepCount;
+            }
 
             const subagentRefs = extractSubagentRefsFromSteps(rawSteps);
+            const ownSwarmManifest = !conv.isSubagent ? readSwarmManifestForCascade(cidLower) : null;
+            if (ownSwarmManifest?.workerRefs?.length) {
+              const seenRefCids = new Set(subagentRefs.map((r) => r.cascadeId));
+              for (const wRef of ownSwarmManifest.workerRefs) {
+                if (!seenRefCids.has(wRef.cascadeId)) {
+                  seenRefCids.add(wRef.cascadeId);
+                  subagentRefs.push(wRef);
+                }
+              }
+              if (!nonShortTitle(conv.title) && ownSwarmManifest.title) {
+                conv.title = ownSwarmManifest.title;
+              }
+            }
             conv.subagentRefs = subagentRefs;
 
             const lastStepMs = nextLast?.createdAtMs || 0;
             const resolvedLastModMs = Math.max(conv.lastModifiedMs || 0, lastStepMs);
             conv.lastModifiedMs = resolvedLastModMs;
             conv.stepCount = steps.length;
+            const finalSig = buildConvSig(conv);
+
+            const effectiveIsRunning = isRunning && !isParkedOnSwarmWait(rawSteps);
+            if (!effectiveIsRunning && conv.status === 'CASCADE_RUN_STATUS_RUNNING') {
+              conv.status = 'IDLE';
+            }
 
             const liveAct = resolveBestLiveActivity(
               conv.cascadeId,
               rawSteps,
-              isRunning,
+              effectiveIsRunning,
               resolvedLastModMs || conv.createdTimeMs || 0
             );
-            if (liveAct) {
+            if (liveAct && liveAct.actionKey !== 'swarm_wait') {
               conv.liveActivity = liveAct;
-              liveActivityMemo.set(conv.cascadeId.toLowerCase(), liveAct);
+              liveActivityMemo.set(cidLower, liveAct);
             } else {
+              if (liveAct?.actionKey === 'swarm_wait') {
+                conv.status = 'IDLE';
+              }
               conv.liveActivity = null;
-              liveActivityMemo.delete(conv.cascadeId.toLowerCase());
+              liveActivityMemo.delete(cidLower);
+              liveSpeedTrackerMap.delete(cidLower);
             }
 
+            const entryAccountName = prev ? prev.accountName || '' : currentAccountName || '';
+            const stepsWithOwners = attachStepAccountOwners(
+              steps,
+              prev,
+              currentAccountName,
+              entryAccountName
+            );
             const cacheEntry = {
-              signature: sig,
-              accountName: prev?.accountName || currentAccountName || '',
+              signature: finalSig,
+              accountName: entryAccountName,
               title: conv.title,
               lastModifiedMs: resolvedLastModMs,
-              diskMtimeMs: conv.diskMtimeMs || 0,
-              wasRunning: isRunning,
-              steps,
+              diskMtimeMs:
+                conv.diskMtimeMs ?? readConversationMtime(diskConvMap.get(cidLower)),
+              rawStepCount: conv.rawStepCount ?? stepsWithOwners.length,
+              wasRunning: conv.status === 'CASCADE_RUN_STATUS_RUNNING',
+              contextLimitTelemetry: true,
+              speedClearedTelemetry: true,
+              turnRailTelemetry: true,
+              wakeupTurnTelemetry: true,
+              contextGroupsTelemetry: 2,
+              anomalyTelemetry: 1,
+              steps: stepsWithOwners,
               subagentRefs,
             };
+            if (conv.diskFileSig) cacheEntry.diskFileSig = conv.diskFileSig;
+            if (conv.appSource && conv.appSource !== 'standalone') {
+              cacheEntry.appSource = conv.appSource;
+            }
+            if (conv.isSideQuestion) {
+              cacheEntry.isSideQuestion = true;
+            }
             if (conv.isSubagent) {
               cacheEntry.parentConversationId = conv.parentConversationId;
               cacheEntry.rootConversationId = conv.rootConversationId;
@@ -917,27 +2056,132 @@ export async function enumerateAndSyncConversations({
             const metaChanged =
               !Array.isArray(prev?.subagentRefs) ||
               JSON.stringify(prev?.subagentRefs) !== JSON.stringify(subagentRefs) ||
-              (prev?.rootConversationId || '') !== (cacheEntry.rootConversationId || '');
+              (prev?.rootConversationId || '') !== (cacheEntry.rootConversationId || '') ||
+              Boolean(prev?.isSideQuestion) !== Boolean(cacheEntry.isSideQuestion);
             const stepsChanged =
               !prev ||
-              prev.signature !== sig ||
+              Boolean(prev.offlineTranscriptFallback) ||
+              prev.signature !== finalSig ||
               Boolean(prev.wasRunning) !== isRunning ||
+              !prev.contextLimitTelemetry ||
+              !prev.speedClearedTelemetry ||
+              !prev.turnRailTelemetry ||
+              !prev.contextGroupsTelemetry ||
+              !prev.anomalyTelemetry ||
               metaChanged ||
-              JSON.stringify(prev.steps) !== JSON.stringify(steps);
+              !isDeepStrictEqual(prev.steps, stepsWithOwners);
 
-            trajectoryCache[conv.cascadeId] = cacheEntry;
+            if (!stepsChanged) cacheEntry.steps = prev.steps;
+            setCachedTrajectory(conv.cascadeId, cacheEntry);
             if (stepsChanged) {
               cacheDirty = true;
             }
           } catch (err) {
-            console.error(`Failed loading trajectory ${conv.cascadeId}: ${err.message}`);
-            if (!(isRunning && hasTailStepInfo)) {
+            let offlineRecovered = false;
+            if (!conv.inSummaries && (!prev || prev.offlineTranscriptFallback)) {
+              if (!lazyExternalByLower) {
+                lazyExternalByLower = new Map();
+                for (const ext of loadExternalDeepStatsCache().values()) {
+                  const extCid = String(ext?.cascadeId || '').toLowerCase();
+                  if (!extCid) continue;
+                  const existingExt = lazyExternalByLower.get(extCid);
+                  if (!existingExt || (ext.steps?.length || 0) > (existingExt.steps?.length || 0)) {
+                    lazyExternalByLower.set(extCid, ext);
+                  }
+                }
+              }
+              const cidLower = conv.cascadeId.toLowerCase();
+              const diskFiles = diskConvMap.get(cidLower) || [];
+              const offlineFallback = loadOfflineTranscriptConversation(
+                conv,
+                diskFiles,
+                lazyExternalByLower,
+                localSummaryByLower.get(cidLower) || null
+              );
+              if (offlineFallback) {
+                offlineRecovered = true;
+                conv.title = offlineFallback.title;
+                conv.lastModifiedMs = offlineFallback.lastModifiedMs;
+                conv.stepCount = offlineFallback.steps.length;
+                conv.subagentRefs = offlineFallback.subagentRefs;
+                if (offlineFallback.parentConversationId) {
+                  conv.parentConversationId = offlineFallback.parentConversationId;
+                }
+                if (offlineFallback.rootConversationId) {
+                  conv.rootConversationId = offlineFallback.rootConversationId;
+                }
+                conv.isSubagent =
+                  Boolean(conv.parentConversationId) ||
+                  Boolean(conv.rootConversationId && conv.rootConversationId !== cidLower);
+                const resolvedDiskMtime = conv.diskMtimeMs ?? readConversationMtime(diskFiles);
+                const offlineAccountName = prev
+                  ? prev.accountName || offlineFallback.accountName || ''
+                  : offlineFallback.accountName || currentAccountName || '';
+                const offlineStepsWithOwners = attachStepAccountOwners(
+                  offlineFallback.steps,
+                  prev,
+                  offlineFallback.accountName || currentAccountName,
+                  offlineAccountName
+                );
+                const offlineEntry = {
+                  signature: sig,
+                  accountName: offlineAccountName,
+                  title: offlineFallback.title,
+                  ...(offlineFallback.appSource ? { appSource: offlineFallback.appSource } : {}),
+                  lastModifiedMs: offlineFallback.lastModifiedMs,
+                  diskMtimeMs: resolvedDiskMtime,
+                  wasRunning: isRunning,
+                  offlineTranscriptFallback: true,
+                  ...(offlineFallback.fromSqlite ? { offlineSqliteTelemetry: true } : {}),
+                  contextLimitTelemetry: true,
+                  speedClearedTelemetry: true,
+                  turnRailTelemetry: true,
+                  contextGroupsTelemetry: 2,
+                  anomalyTelemetry: 1,
+                  steps: offlineStepsWithOwners,
+                  subagentRefs: offlineFallback.subagentRefs,
+                };
+                if (conv.isSubagent) {
+                  offlineEntry.parentConversationId = conv.parentConversationId;
+                  offlineEntry.rootConversationId = conv.rootConversationId;
+                  if (conv.subagentSpec) offlineEntry.subagentSpec = conv.subagentSpec;
+                  if (conv.agentScriptName) offlineEntry.agentScriptName = conv.agentScriptName;
+                  if (conv.createdTimeMs) offlineEntry.createdTimeMs = conv.createdTimeMs;
+                  if (Number.isFinite(conv.spawnOrder)) offlineEntry.spawnOrder = conv.spawnOrder;
+                }
+                const changed =
+                  !prev ||
+                  prev.signature !== sig ||
+                  prev.title !== offlineEntry.title ||
+                  Boolean(prev.wasRunning) !== isRunning ||
+                  Boolean(prev.offlineSqliteTelemetry) !== Boolean(offlineEntry.offlineSqliteTelemetry) ||
+                  !isDeepStrictEqual(prev.steps, offlineEntry.steps);
+                if (!changed) offlineEntry.steps = prev.steps;
+                setCachedTrajectory(conv.cascadeId, offlineEntry);
+                if (changed) {
+                  cacheDirty = true;
+                }
+              }
+            }
+            if (
+              !offlineRecovered &&
+              !(
+                !conv.inSummaries &&
+                /(?:\(404\)|\bnot_found\b|Language Server address unavailable)/i.test(
+                  String(err?.message || '')
+                )
+              )
+            ) {
+              console.error(`Failed loading trajectory ${conv.cascadeId}: ${err.message}`);
+            }
+            if (!(isRunning && (hasTailStepInfo || offlineRecovered))) {
               const cooldownMs =
                 isRunning || isReq ? ACTIVE_FAILED_RPC_COOLDOWN_MS : FAILED_RPC_COOLDOWN_MS;
               failedFetchCooldownMap.set(cooldownKey, { failedAt: nowPollMs, cooldownMs });
             }
             if (!isRunning) {
               liveActivityMemo.delete(conv.cascadeId.toLowerCase());
+              liveSpeedTrackerMap.delete(conv.cascadeId.toLowerCase());
             } else {
               const fallbackLive = resolveBestLiveActivity(
                 conv.cascadeId,
@@ -951,11 +2195,13 @@ export async function enumerateAndSyncConversations({
               }
             }
             if (
+              !offlineRecovered &&
               prev &&
+              getCachedTrajectory(conv.cascadeId) === prev &&
               String(prev.signature || '').startsWith(`${CACHE_SCHEMA_VERSION}:`) &&
               !Array.isArray(prev.subagentRefs)
             ) {
-              prev.subagentRefs = [];
+              setCachedTrajectory(conv.cascadeId, { ...prev, subagentRefs: [] });
               cacheDirty = true;
             }
           }
@@ -965,29 +2211,129 @@ export async function enumerateAndSyncConversations({
   }
 
   // 阶段 1：拉取常规新增/变更会话，以及摘要列表中尚未提取 subagentRefs 的会话
+  // 旧缓存只补读当前会话的宿主上限，避免重拉全部历史轨迹。
+  const contextTelemetryCascadeId = reqLower || rawConversations[0]?.cascadeId.toLowerCase();
+  const selectedRootId = rawConversations.find(
+    (c) => c.cascadeId.toLowerCase() === contextTelemetryCascadeId
+  )?.rootConversationId || contextTelemetryCascadeId;
+  function hasMissingTurnRailFields(cached) {
+    const steps = cached?.steps || [];
+    const lastCachedStep = steps[steps.length - 1];
+    if (!lastCachedStep) return false;
+    return !Object.prototype.hasOwnProperty.call(lastCachedStep, 'turnIndex');
+  }
+  function hasDroppedContextGroups(cached) {
+    if (cached?.contextGroupsTelemetry === 2) return false;
+    const steps = cached?.steps || [];
+    if (steps.some((st) => st?.isCompactionStep)) {
+      return true;
+    }
+    if (cached?.contextGroupsTelemetry) return false;
+    for (let i = steps.length - 1; i >= 0; i--) {
+      const st = steps[i];
+      if (!st || st.isCompactionStep) break;
+      if (st.contextBreakdown) {
+        const cb = st.contextBreakdown;
+        const cbSum =
+          Number(cb.totalTokens || 0) ||
+          Number(cb.messagesTokens || 0) +
+            Number(cb.systemToolsTokens || 0) +
+            Number(cb.mcpToolsTokens || 0) +
+            Number(cb.skillsTokens || 0) +
+            Number(cb.systemPromptTokens || 0) +
+            Number(cb.userRulesTokens || 0);
+        return Number(st.estimatedContextTokens || 0) > cbSum;
+      }
+    }
+    return false;
+  }
+
+  function needsWakeupTurnRefresh(conv, cached) {
+    if (!conv?.isSubagent || conv.isSideQuestion || cached?.wakeupTurnTelemetry) return false;
+    const steps = cached?.steps || [];
+    return steps.length > 0 && steps.every((s) => !s?.turnIndex);
+  }
+
+  let remainingTimingRefreshes = LEGACY_MIGRATION_BATCH_SIZE;
   const toFetch = rawConversations.filter((conv) => {
     const sig = buildConvSig(conv);
     if (isFetchInCooldown(conv, sig)) return false;
-    const cached = trajectoryCache[conv.cascadeId];
+    const isRunning = conv.status === 'CASCADE_RUN_STATUS_RUNNING';
+    const cached = getCachedTrajectory(conv.cascadeId);
     if (!cached || conv.needsInitialLoad) return true;
+    const lowerCid = conv.cascadeId.toLowerCase();
+    const isSelectedFamily =
+      lowerCid === contextTelemetryCascadeId ||
+      lowerCid === selectedRootId ||
+      Boolean(conv.rootConversationId && conv.rootConversationId.toLowerCase() === selectedRootId);
+    if (!cached.contextLimitTelemetry && lowerCid === contextTelemetryCascadeId) return true;
+    if (
+      (!cached.turnRailTelemetry ||
+        !cached.anomalyTelemetry ||
+        hasMissingTurnRailFields(cached) ||
+        needsWakeupTurnRefresh(conv, cached) ||
+        hasDroppedContextGroups(cached)) &&
+      isSelectedFamily
+    ) {
+      return true;
+    }
     const hasCurrentSchema = String(cached.signature || '').startsWith(
       `${CACHE_SCHEMA_VERSION}:`
     );
     if (!hasCurrentSchema) return true;
+    if (
+      conv.dbPath &&
+      sqliteAvailable &&
+      !String(cached.signature || '').startsWith(`${CACHE_SCHEMA_VERSION}:sqlite:`)
+    ) {
+      return true;
+    }
     if (hasMissingStepFields(cached)) return true;
     const missingSubagentRefs = !Array.isArray(cached.subagentRefs);
     if (!conv.inSummaries) {
-      if (missingSubagentRefs && conv.cascadeId.toLowerCase() === reqLower) {
+      if (isRunning || cached.wasRunning) return true;
+      if (conv.dbPath && sqliteAvailable) {
+        return cached.signature !== sig;
+      }
+      if (
+        cached.offlineTranscriptFallback &&
+        !cached.offlineSqliteTelemetry &&
+        hasBuiltinNodeSqlite() &&
+        hasLocalSqliteDb(diskConvMap.get(lowerCid))
+      ) {
         return true;
       }
-      return (
+      const localSum = localSummaryByLower.get(lowerCid);
+      if (cached.offlineTranscriptFallback && localSum?.title && cached.title !== localSum.title) {
+        return true;
+      }
+      if (missingSubagentRefs && lowerCid === reqLower) {
+        return true;
+      }
+      if (
         conv.diskMtimeMs > 0 &&
         conv.diskMtimeMs > (cached.diskMtimeMs || cached.lastModifiedMs || 0)
-      );
+      ) return true;
+    } else {
+      if (
+        cached.offlineTranscriptFallback ||
+        missingSubagentRefs ||
+        cached.signature !== sig ||
+        isRunning ||
+        cached.wasRunning
+      ) {
+        return true;
+      }
     }
-    if (missingSubagentRefs) return true;
-    const isRunning = conv.status === 'CASCADE_RUN_STATUS_RUNNING';
-    return cached.signature !== sig || isRunning || Boolean(cached.wasRunning);
+    // 保留已有效的历史测速，按批补读需要确认原始状态与生成结束时间的旧步骤。
+    if (!cached.speedClearedTelemetry && readStepFieldChecks(cached.steps).hasIncompleteTiming) {
+      if (conv.cascadeId.toLowerCase() === selectedRootId || conv.rootConversationId === selectedRootId) return true;
+      if (remainingTimingRefreshes > 0) {
+        remainingTimingRefreshes -= 1;
+        return true;
+      }
+    }
+    return false;
   });
 
   await fetchTrajectoryBatch(toFetch);
@@ -1002,8 +2348,23 @@ export async function enumerateAndSyncConversations({
       const missingSubagentsToFetch = [];
 
       for (const parentConv of [...rawConversations]) {
-        const parentCached = trajectoryCache[parentConv.cascadeId];
-        const refs = parentConv.subagentRefs || parentCached?.subagentRefs || [];
+        const parentCached = getCachedTrajectory(parentConv.cascadeId);
+        const baseRefs = parentConv.subagentRefs || parentCached?.subagentRefs || [];
+        const swarmManifest = !parentConv.isSubagent
+          ? readSwarmManifestForCascade(parentConv.cascadeId)
+          : null;
+        let refs = baseRefs;
+        if (swarmManifest?.workerRefs?.length) {
+          const merged = Array.isArray(baseRefs) ? baseRefs.slice() : [];
+          const seenRefCids = new Set(merged.map((r) => String(r?.cascadeId || '').toLowerCase()));
+          for (const wRef of swarmManifest.workerRefs) {
+            if (!seenRefCids.has(wRef.cascadeId)) {
+              seenRefCids.add(wRef.cascadeId);
+              merged.push(wRef);
+            }
+          }
+          refs = merged;
+        }
         if (!Array.isArray(refs) || refs.length === 0) continue;
 
         const parentId = parentConv.cascadeId.toLowerCase();
@@ -1020,9 +2381,14 @@ export async function enumerateAndSyncConversations({
           const canonSubId = canonicalIdByLower.get(subCid) || subCid;
           canonicalIdByLower.set(subCid, canonSubId);
           let subConv = byLowerId.get(subCid);
-          const subCached = trajectoryCache[subConv?.cascadeId || canonSubId];
+          const subCached = getCachedTrajectory(subConv?.cascadeId || canonSubId);
           if (!subConv) {
-            const diskMtimeMs = diskConvMap.get(subCid) || 0;
+            const subDiskFiles = diskConvMap.get(subCid) || [];
+            const subDbInfo = sqliteAvailable ? resolveBestSqliteDbInfo(subDiskFiles) : null;
+            const diskMtimeMs = Math.max(
+              readConversationMtime(subDiskFiles),
+              subDbInfo?.mtimeMs || 0
+            );
             const lastStepMs = subCached?.steps?.[subCached.steps.length - 1]?.createdAtMs || 0;
             const stepCount = Number(subCached?.steps?.length || 0);
             subConv = {
@@ -1039,9 +2405,13 @@ export async function enumerateAndSyncConversations({
                 ref.createdTimeMs || 0
               ),
               diskMtimeMs,
+              dbPath: subDbInfo?.dbPath || '',
+              diskFileSig: subDbInfo?.sig || '',
+              appSource: inferAppSourceFromSummary('', subDiskFiles, subCached?.appSource || 'standalone'),
               inSummaries: false,
               needsInitialLoad: !subCached,
               isSubagent: true,
+              isSideQuestion: false,
               parentConversationId: parentId,
               rootConversationId: rootId,
               subagentSpec: mergeSubagentSpecs(ref, subCached?.subagentSpec),
@@ -1069,49 +2439,56 @@ export async function enumerateAndSyncConversations({
           }
 
           const targetCacheKey = subConv.cascadeId;
-          const existingSubCache = trajectoryCache[targetCacheKey];
+          const existingSubCache = getCachedTrajectory(targetCacheKey);
+          const isSelectedSubFamily = rootId === selectedRootId;
           const hasValidSubCache =
             existingSubCache &&
-            String(existingSubCache.signature || '').startsWith(`${CACHE_SCHEMA_VERSION}:`) &&
-            !hasMissingStepFields(existingSubCache);
+            !(existingSubCache.offlineTranscriptFallback && subConv.inSummaries) &&
+            String(existingSubCache.signature || '').startsWith(
+              subConv.dbPath && sqliteAvailable
+                ? `${CACHE_SCHEMA_VERSION}:sqlite:`
+                : `${CACHE_SCHEMA_VERSION}:`
+            ) &&
+            !hasMissingStepFields(existingSubCache) &&
+            (!isSelectedSubFamily ||
+              (Boolean(existingSubCache.turnRailTelemetry) &&
+                Boolean(existingSubCache.anomalyTelemetry) &&
+                !hasMissingTurnRailFields(existingSubCache) &&
+                !needsWakeupTurnRefresh(subConv, existingSubCache) &&
+                !hasDroppedContextGroups(existingSubCache)));
 
           if (hasValidSubCache) {
-            let subMetaUpdated = false;
+            const updatedMetadata = {};
             if (existingSubCache.parentConversationId !== subConv.parentConversationId) {
-              existingSubCache.parentConversationId = subConv.parentConversationId;
-              subMetaUpdated = true;
+              updatedMetadata.parentConversationId = subConv.parentConversationId;
             }
             if (existingSubCache.rootConversationId !== subConv.rootConversationId) {
-              existingSubCache.rootConversationId = subConv.rootConversationId;
-              subMetaUpdated = true;
+              updatedMetadata.rootConversationId = subConv.rootConversationId;
             }
             const nextSpec = sanitizeSubagentSpec(subConv.subagentSpec);
             if (
               nextSpec &&
               JSON.stringify(existingSubCache.subagentSpec || null) !== JSON.stringify(nextSpec)
             ) {
-              existingSubCache.subagentSpec = nextSpec;
-              subMetaUpdated = true;
+              updatedMetadata.subagentSpec = nextSpec;
             }
             if (
               subConv.createdTimeMs &&
               existingSubCache.createdTimeMs !== subConv.createdTimeMs
             ) {
-              existingSubCache.createdTimeMs = subConv.createdTimeMs;
-              subMetaUpdated = true;
+              updatedMetadata.createdTimeMs = subConv.createdTimeMs;
             }
             if (
               Number.isFinite(subConv.spawnOrder) &&
               existingSubCache.spawnOrder !== subConv.spawnOrder
             ) {
-              existingSubCache.spawnOrder = subConv.spawnOrder;
-              subMetaUpdated = true;
+              updatedMetadata.spawnOrder = subConv.spawnOrder;
             }
             if (!Array.isArray(existingSubCache.subagentRefs)) {
-              existingSubCache.subagentRefs = [];
-              subMetaUpdated = true;
+              updatedMetadata.subagentRefs = [];
             }
-            if (subMetaUpdated) {
+            if (Object.keys(updatedMetadata).length > 0) {
+              setCachedTrajectory(targetCacheKey, { ...existingSubCache, ...updatedMetadata });
               cacheDirty = true;
             }
           } else {
@@ -1137,7 +2514,7 @@ export async function enumerateAndSyncConversations({
       if (attemptedFetchIds.has(c.cascadeId.toLowerCase()) || isFetchInCooldown(c, sig)) {
         return false;
       }
-      const cached = trajectoryCache[c.cascadeId];
+      const cached = getCachedTrajectory(c.cascadeId);
       return cached && !Array.isArray(cached.subagentRefs);
     })
     .slice(0, LEGACY_MIGRATION_BATCH_SIZE);
@@ -1153,6 +2530,9 @@ export async function enumerateAndSyncConversations({
     if (!conv.isSubagent) continue;
     const cid = conv.cascadeId.toLowerCase();
     let candidate = (conv.rootConversationId || conv.parentConversationId || '').toLowerCase();
+    if (candidate === cid) {
+      candidate = (conv.parentConversationId || '').toLowerCase();
+    }
     const visited = new Set([cid]);
     while (candidate && !visited.has(candidate)) {
       visited.add(candidate);
@@ -1168,33 +2548,52 @@ export async function enumerateAndSyncConversations({
     }
     if (candidate && candidate !== conv.rootConversationId) {
       conv.rootConversationId = candidate;
-      const cached = trajectoryCache[conv.cascadeId];
+      const cached = getCachedTrajectory(conv.cascadeId);
       if (cached && cached.rootConversationId !== candidate) {
-        cached.rootConversationId = candidate;
+        setCachedTrajectory(conv.cascadeId, { ...cached, rootConversationId: candidate });
         cacheDirty = true;
       }
     }
   }
 
-  if (cacheDirty) {
-    cacheState.needsSave = !saveJson(CACHE_FILE, trajectoryCache);
+  const hasRunningSessions = rawConversations.some(
+    (c) => c.status === 'CASCADE_RUN_STATUS_RUNNING'
+  );
+  if (cacheDirty || (hasPendingTrajectoryCacheSave() && !hasRunningSessions)) {
+    persistTrajectoryCacheIfNeeded({ hasRunningSessions });
   }
 
-  // 确保所有处于 RUNNING 状态的会话（含本轮未触发 RPC 拉取的会话）都同步了最新的实时动作摘要
+  // 确保所有处于 RUNNING 状态的会话（含本轮未触发 RPC 拉取的会话）都同步了最新的实时动作摘要，并剔除已进入 swarm_wait 待命的假运行态
   for (const conv of rawConversations) {
     if (conv.status === 'CASCADE_RUN_STATUS_RUNNING') {
       if (!conv.liveActivity) {
+        const tailSteps = readTranscriptTailSteps(conv.cascadeId);
+        if (isParkedOnSwarmWait(tailSteps)) {
+          conv.status = 'IDLE';
+          conv.liveActivity = null;
+          liveActivityMemo.delete(conv.cascadeId.toLowerCase());
+          continue;
+        }
         const fallbackMs = conv.lastModifiedMs || conv.createdTimeMs || 0;
         const resolved = resolveBestLiveActivity(conv.cascadeId, [], true, fallbackMs);
+        if (resolved?.actionKey === 'swarm_wait') {
+          conv.status = 'IDLE';
+          conv.liveActivity = null;
+          liveActivityMemo.delete(conv.cascadeId.toLowerCase());
+          continue;
+        }
         conv.liveActivity = resolved;
         if (resolved) {
           liveActivityMemo.set(conv.cascadeId.toLowerCase(), resolved);
         }
+      } else if (conv.liveActivity.actionKey === 'swarm_wait') {
+        conv.status = 'IDLE';
+        conv.liveActivity = null;
+        liveActivityMemo.delete(conv.cascadeId.toLowerCase());
       }
     } else {
       conv.liveActivity = null;
       liveActivityMemo.delete(conv.cascadeId.toLowerCase());
-      liveSpeedTrackerMap.delete(conv.cascadeId.toLowerCase());
     }
   }
 
@@ -1206,12 +2605,28 @@ export async function enumerateAndSyncConversations({
     const cid = conv.cascadeId.toLowerCase();
     const rootId = (conv.rootConversationId || conv.parentConversationId || '').toLowerCase();
     const rootTarget = byId.get(rootId);
-    if (conv.isSubagent) {
-      if (rootId && rootId !== cid && rootTarget && !rootTarget.isSubagent) {
+    if (conv.isSubagent || conv.isSideQuestion) {
+      if (
+        conv.isSideQuestion &&
+        Number(conv.stepCount || 0) === 0 &&
+        conv.status !== 'CASCADE_RUN_STATUS_RUNNING' &&
+        cid !== reqLower
+      ) {
+        continue;
+      }
+      if (
+        rootId &&
+        rootId !== cid &&
+        rootTarget &&
+        !rootTarget.isSubagent &&
+        !rootTarget.isSideQuestion
+      ) {
         if (!subagentsByRoot.has(rootId)) {
           subagentsByRoot.set(rootId, []);
         }
         subagentsByRoot.get(rootId).push(conv);
+      } else if (conv.isSideQuestion && cid === reqLower) {
+        conversations.push(conv);
       }
     } else {
       conversations.push(conv);
@@ -1220,9 +2635,72 @@ export async function enumerateAndSyncConversations({
 
   for (const rootConv of conversations) {
     const cid = rootConv.cascadeId.toLowerCase();
+    const swarmManifest = readSwarmManifestForCascade(cid);
+    const swarmTitle = String(swarmManifest?.title || '').trim();
+    if (swarmTitle) {
+      rootConv.swarmTitle = swarmTitle;
+      const curTitle = String(rootConv.title || '').trim();
+      if (!curTitle || curTitle.toLowerCase() === cid.slice(0, 8)) {
+        rootConv.title = swarmTitle;
+      }
+    }
+    if (swarmManifest?.coordinator?.killed || rootConv.killed) {
+      rootConv.status = 'IDLE';
+      rootConv.liveActivity = null;
+    }
+
     const subs = subagentsByRoot.get(cid) || [];
+    let swarmCount = 0;
+    for (const s of subs) {
+      const subLower = s.cascadeId.toLowerCase();
+      const mEntry = swarmManifest?.membersByCid.get(subLower) || null;
+      const subCached = getCachedTrajectory(s.cascadeId);
+      const parsedSwarm = !s.isSideQuestion
+        ? parseSwarmWorkerRole({
+            role: s.subagentSpec?.role || subCached?.subagentSpec?.role || '',
+            typeName: s.subagentSpec?.typeName || subCached?.subagentSpec?.typeName || '',
+            agentScriptName: s.agentScriptName || subCached?.agentScriptName || '',
+            memberName: mEntry?.memberName || '',
+          })
+        : { isSwarmWorker: false };
+      if (parsedSwarm.isSwarmWorker) {
+        swarmCount += 1;
+        s.isSwarmWorker = true;
+        s.swarmMemberName = parsedSwarm.memberName;
+        s.isSwarmAuxiliary = Boolean(parsedSwarm.isAuxiliary);
+        s.killed = Boolean(s.killed || mEntry?.killed);
+        if (s.killed) {
+          s.status = 'IDLE';
+          s.liveActivity = null;
+          liveActivityMemo.delete(subLower);
+          s.swarmState = 'killed';
+        } else if (s.status === 'CASCADE_RUN_STATUS_RUNNING') {
+          const parkedInManifest =
+            Boolean(mEntry) &&
+            (mEntry.wakeMode === 'mentions' || mEntry.wakeMode === 'anything') &&
+            (!s.liveActivity || s.liveActivity.signature === 'init:0');
+          if (s.liveActivity?.actionKey === 'swarm_wait' || parkedInManifest) {
+            s.status = 'IDLE';
+            s.liveActivity = null;
+            liveActivityMemo.delete(subLower);
+            s.swarmState = 'waiting';
+          } else {
+            s.swarmState = 'working';
+          }
+        } else {
+          s.swarmState = 'waiting';
+        }
+      }
+    }
+
     subs.sort((a, b) => {
+      const aSide = Boolean(a.isSideQuestion);
+      const bSide = Boolean(b.isSideQuestion);
+      if (aSide !== bSide) {
+        return aSide ? 1 : -1;
+      }
       if (
+        !aSide &&
         a.parentConversationId === b.parentConversationId &&
         Number.isFinite(a.spawnOrder) &&
         Number.isFinite(b.spawnOrder) &&
@@ -1232,18 +2710,19 @@ export async function enumerateAndSyncConversations({
       }
       const aStart =
         a.createdTimeMs ||
-        trajectoryCache[a.cascadeId]?.steps?.[0]?.createdAtMs ||
+        getCachedTrajectory(a.cascadeId)?.steps?.[0]?.createdAtMs ||
         a.lastModifiedMs ||
         0;
       const bStart =
         b.createdTimeMs ||
-        trajectoryCache[b.cascadeId]?.steps?.[0]?.createdAtMs ||
+        getCachedTrajectory(b.cascadeId)?.steps?.[0]?.createdAtMs ||
         b.lastModifiedMs ||
         0;
       return aStart - bStart || String(a.cascadeId).localeCompare(String(b.cascadeId));
     });
     rootConv.subagents = subs;
     rootConv.subagentCount = subs.length;
+    rootConv.swarmCount = swarmCount;
     rootConv.totalStepCount =
       Number(rootConv.stepCount || 0) +
       subs.reduce((sum, s) => sum + Number(s.stepCount || 0), 0);

@@ -6,56 +6,99 @@
 
 :root,
 :host {
+  /* Cross-Platform Typography Stacks (macOS SF Pro / SF Mono + Windows / Linux Fallbacks) */
+  --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", Roboto, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Monaco, "Cascadia Mono", Consolas, monospace;
+
   /* Architectural Geometry: Only Top Nav uses --radius-pill */
   --radius-pill: 999px;
   --radius-sm: 4px;
   --radius-xs: 2px;
 
-  /* Host-Bridged Surfaces (Clean, zero-muddy-gray light mode & safe dark fallback) */
-  --surface-bg: var(--background, hsl(0 0% 100%));
-  --surface-panel: var(--card, var(--background, hsl(0 0% 100%)));
+  /* Host-Bridged Surfaces (Antigravity 2.0 + Antigravity IDE --vscode-* + safe fallback) */
+  --surface-bg: var(--background, var(--vscode-sideBar-background, var(--vscode-editor-background, hsl(0 0% 100%))));
+  --surface-panel: var(
+    --card,
+    var(
+      --background,
+      var(--vscode-editorWidget-background, var(--vscode-sideBar-background, var(--vscode-editor-background, hsl(0 0% 100%))))
+    )
+  );
   --surface-subtle: color-mix(in srgb, var(--surface-panel) 97%, var(--text-primary) 3%);
   --surface-track: color-mix(in srgb, var(--border-hairline) 42%, var(--surface-panel));
   --surface-hover: color-mix(in srgb, var(--accent-primary) 6%, var(--surface-panel));
   --surface-active: color-mix(in srgb, var(--accent-primary) 12%, var(--surface-panel));
 
   /* Crisp 1px Hairline Borders */
-  --border-hairline: color-mix(in srgb, var(--border, hsl(214 18% 88%)) 82%, var(--surface-panel));
+  --border-hairline: color-mix(
+    in srgb,
+    var(
+      --border,
+      var(
+        --vscode-widget-border,
+        var(
+          --vscode-panel-border,
+          var(--vscode-contrastBorder, color-mix(in srgb, var(--text-primary) 18%, var(--surface-panel)))
+        )
+      )
+    ) 82%,
+    var(--surface-panel)
+  );
   --border-strong: color-mix(in srgb, var(--border-hairline) 72%, var(--text-primary) 28%);
 
-  /* Typography Hierarchy */
-  --text-primary: var(--foreground, hsl(215 22% 15%));
-  --text-secondary: var(--muted-foreground, hsl(215 12% 44%));
+  /* Typography Hierarchy & Scalable Font Tokens */
+  --fs-2xs: calc(10.5px * var(--ui-font-scale, 1));
+  --fs-xs: calc(11px * var(--ui-font-scale, 1));
+  --fs-sm: calc(11.5px * var(--ui-font-scale, 1));
+  --fs-md: calc(12px * var(--ui-font-scale, 1));
+  --fs-base-sm: calc(12.5px * var(--ui-font-scale, 1));
+  --fs-base: calc(13px * var(--ui-font-scale, 1));
+  --fs-body: calc(13px * var(--ui-font-scale, 1));
+  --fs-lg: calc(15px * var(--ui-font-scale, 1));
+  --fs-hero: calc(18px * var(--ui-font-scale, 1));
+
+  --text-primary: var(--foreground, var(--vscode-foreground, var(--vscode-editor-foreground, hsl(215 22% 15%))));
+  --text-secondary: var(--muted-foreground, var(--vscode-descriptionForeground, hsl(215 12% 44%)));
   --text-muted: color-mix(in srgb, var(--text-secondary) 74%, var(--surface-panel) 26%);
-  --text-inverse: var(--surface-panel);
+  --text-inverse: var(--user-accent-contrast, var(--surface-panel));
 
   /* Semantic Telemetry Accents */
-  --accent-primary: var(--primary, hsl(217 82% 51%));
+  --accent-primary: var(
+    --user-accent-primary,
+    var(
+      --primary,
+      var(--vscode-textLink-foreground, var(--vscode-button-background, hsl(217 82% 51%)))
+    )
+  );
   --accent-primary-soft: color-mix(in srgb, var(--accent-primary) 13%, transparent);
   --accent-primary-border: color-mix(in srgb, var(--accent-primary) 38%, var(--border-hairline));
 
   --metric-speed: hsl(14 76% 52%);
   --metric-speed-soft: color-mix(in srgb, var(--metric-speed) 14%, transparent);
 
-  --metric-ok: hsl(145 64% 38%);
+  --metric-ok: hsl(145 64% 41%);
   --metric-ok-soft: color-mix(in srgb, var(--metric-ok) 14%, transparent);
 
-  --metric-warn: hsl(34 86% 44%);
+  --metric-info: hsl(197 82% 46%);
+  --metric-info-soft: color-mix(in srgb, var(--metric-info) 14%, transparent);
+
+  --metric-warn: hsl(35 88% 47%);
   --metric-warn-soft: color-mix(in srgb, var(--metric-warn) 15%, transparent);
 
-  --metric-danger: var(--destructive, hsl(0 74% 50%));
+  --metric-danger: hsl(4 78% 55%);
+  --metric-danger-soft: color-mix(in srgb, var(--metric-danger) 14%, transparent);
 
   /* Context Window 10-Channel Palette */
-  --ctx-assistant: hsl(217 82% 54%);
-  --ctx-tool-results: hsl(192 82% 43%);
-  --ctx-user-input: hsl(245 72% 62%);
-  --ctx-subagent-msg: hsl(280 70% 58%);
-  --ctx-checkpoint: hsl(38 90% 50%);
-  --ctx-system-tools: hsl(22 86% 50%);
-  --ctx-mcp-tools: hsl(316 72% 54%);
-  --ctx-skills: hsl(145 64% 38%);
-  --ctx-system-prompt: hsl(168 72% 40%);
-  --ctx-user-rules: hsl(346 78% 54%);
+  --ctx-assistant: hsl(215 62% 52%);
+  --ctx-tool-results: hsl(172 68% 40%);
+  --ctx-user-input: hsl(256 76% 62%);
+  --ctx-subagent-msg: hsl(286 64% 58%);
+  --ctx-checkpoint: hsl(42 90% 49%);
+  --ctx-system-tools: hsl(24 86% 52%);
+  --ctx-mcp-tools: hsl(336 78% 58%);
+  --ctx-skills: hsl(150 60% 41%);
+  --ctx-system-prompt: hsl(214 26% 54%);
+  --ctx-user-rules: hsl(352 78% 56%);
 
   /* Legacy 4-Channel Palette (retained for compatibility) */
   --ctx-cached: hsl(217 82% 51%);
@@ -78,4 +121,71 @@
   --space-3: 8px;
   --space-4: 10px;
   --space-5: 12px;
+}
+
+:root[data-color-scheme="dark"],
+:host([data-color-scheme="dark"]),
+[data-color-scheme="dark"] {
+  --ctx-assistant: hsl(216 30% 58%);
+  --ctx-tool-results: hsl(168 72% 54%);
+  --ctx-user-input: hsl(258 86% 73%);
+  --ctx-subagent-msg: hsl(288 72% 70%);
+  --ctx-checkpoint: hsl(43 94% 58%);
+  --ctx-system-tools: hsl(24 90% 62%);
+  --ctx-mcp-tools: hsl(338 82% 69%);
+  --ctx-skills: hsl(150 64% 55%);
+  --ctx-system-prompt: hsl(214 28% 68%);
+  --ctx-user-rules: hsl(354 82% 66%);
+}
+
+:root[data-font-scale="sm"],
+:host([data-font-scale="sm"]),
+[data-font-scale="sm"] {
+  --ui-font-scale: 0.92;
+  --ui-panel-scale: 1;
+}
+
+:root[data-font-scale="md"],
+:host([data-font-scale="md"]),
+[data-font-scale="md"] {
+  --ui-font-scale: 1;
+  --ui-panel-scale: 1;
+}
+
+:root[data-font-scale="lg"],
+:host([data-font-scale="lg"]),
+[data-font-scale="lg"] {
+  --ui-font-scale: 1.14;
+  --ui-panel-scale: 1.09;
+}
+
+:root[data-font-scale="xl"],
+:host([data-font-scale="xl"]),
+[data-font-scale="xl"] {
+  --ui-font-scale: 1.28;
+  --ui-panel-scale: 1.18;
+}
+
+[data-font-scale] {
+  --fs-2xs: calc(10.5px * var(--ui-font-scale, 1));
+  --fs-xs: calc(11px * var(--ui-font-scale, 1));
+  --fs-sm: calc(11.5px * var(--ui-font-scale, 1));
+  --fs-md: calc(12px * var(--ui-font-scale, 1));
+  --fs-base-sm: calc(12.5px * var(--ui-font-scale, 1));
+  --fs-base: calc(13px * var(--ui-font-scale, 1));
+  --fs-body: calc(13px * var(--ui-font-scale, 1));
+  --fs-lg: calc(15px * var(--ui-font-scale, 1));
+  --fs-hero: calc(18px * var(--ui-font-scale, 1));
+}
+
+@media (prefers-color-scheme: dark) {
+  html[data-standalone="true"] {
+    color-scheme: dark;
+    --background: hsl(222 18% 10%);
+    --card: hsl(222 16% 13%);
+    --border: hsl(220 14% 21%);
+    --foreground: hsl(214 24% 92%);
+    --muted-foreground: hsl(215 14% 63%);
+    --primary: hsl(217 86% 61%);
+  }
 }

@@ -1,0 +1,861 @@
+/*
+ * 实验性现代化无边框主题与流畅动画样式层 (modern-ui.css).
+ * 仅在根容器或 Shadow Host 携带 [data-modern-ui="true"] 时激活：
+ * 1. 移除绝大部分面板、矩阵、表格、徽章、按钮、输入框与悬浮窗的 1px 线框及分隔线；
+ * 2. 面板内部子数据块（如版本更新价格表/当前版本、消费矩阵指标格、汇总折线区）保持透明扁平，绝不套叠二层背景卡片；
+ * 3. 区分深色与浅色极性 ([data-color-scheme="light" | "dark"])：
+ *    - 深色模式采用柔和提亮顶层卡片与轻薄半透雾面滑槽（绝不混入重黑色块）；
+ *    - 浅色模式采用微凉白瓷画布 (#f7f9fb) + 纯白悬浮顶层卡片 (#ffffff) + 纯白立体滑块；
+ * 4. 全局分段切换器 (.segmented / .long-pill-nav / .settings-thirdnav-bar) 按内容宽度贴合滑动。
+ */
+
+:root[data-modern-ui="true"],
+:host([data-modern-ui="true"]),
+[data-modern-ui="true"] {
+  --radius-sm: 10px;
+  --radius-xs: 7px;
+  --ease-modern: cubic-bezier(0.16, 1, 0.3, 1);
+  --dur-fast: 180ms;
+  --dur-normal: 240ms;
+  --modern-canvas-bg: var(--surface-bg);
+  --modern-surface-card: color-mix(in srgb, var(--surface-panel) 95.2%, #ffffff 4.8%);
+  --modern-surface-subtle: color-mix(in srgb, var(--text-primary) 5.2%, transparent);
+  --modern-surface-hover: color-mix(in srgb, var(--accent-primary) 11%, color-mix(in srgb, var(--text-primary) 4%, transparent));
+  --modern-card-shadow: none;
+  --modern-nav-track-bg: var(--modern-surface-card);
+  --modern-inline-track-bg: color-mix(in srgb, var(--text-primary) 4.2%, transparent);
+  --modern-glider-bg: color-mix(in srgb, var(--accent-primary) 17%, color-mix(in srgb, var(--text-primary) 4%, transparent));
+  --modern-glider-shadow: none;
+  --modern-progress-track: color-mix(in srgb, var(--text-primary) 8%, transparent);
+  --modern-stripe-bg: rgb(255 255 255 / 0.022);
+  --text-secondary: color-mix(in srgb, var(--text-primary) 80%, transparent);
+  --text-muted: color-mix(in srgb, var(--text-primary) 62%, transparent);
+  --modern-active-accent: color-mix(in srgb, var(--accent-primary) 86%, var(--text-primary) 14%);
+  --shadow-popover: 0 10px 28px rgb(0 0 0 / 0.28), 0 2px 8px rgb(0 0 0 / 0.14);
+  --shadow-overlay: 0 22px 52px rgb(0 0 0 / 0.42), 0 4px 16px rgb(0 0 0 / 0.20);
+}
+
+:root[data-modern-ui="true"][data-color-scheme="light"],
+:host([data-modern-ui="true"][data-color-scheme="light"]),
+[data-modern-ui="true"][data-color-scheme="light"] {
+  --modern-canvas-bg: color-mix(in srgb, var(--surface-bg) 95.5%, hsl(216 34% 48%) 4.5%);
+  --modern-surface-card: #ffffff;
+  --modern-surface-subtle: hsl(216 42% 97.2%);
+  --modern-surface-hover: hsl(216 56% 94.4%);
+  --modern-card-shadow: 0 1px 3px rgb(15 23 42 / 0.045), 0 4px 14px rgb(15 23 42 / 0.028);
+  --modern-nav-track-bg: hsl(216 28% 94.2%);
+  --modern-inline-track-bg: hsl(216 32% 96.2%);
+  --modern-glider-bg: #ffffff;
+  --modern-glider-shadow: 0 1px 2px rgb(15 23 42 / 0.08), 0 1px 1px rgb(15 23 42 / 0.04);
+  --modern-progress-track: hsl(216 28% 93.4%);
+  --modern-stripe-bg: hsl(216 40% 97.8%);
+  --text-secondary: color-mix(in srgb, var(--text-primary) 72%, transparent);
+  --text-muted: color-mix(in srgb, var(--text-primary) 58%, transparent);
+  --modern-active-accent: var(--accent-primary);
+  --shadow-popover: 0 10px 28px rgb(15 23 42 / 0.10), 0 2px 8px rgb(15 23 42 / 0.05);
+  --shadow-overlay: 0 20px 48px rgb(15 23 42 / 0.14), 0 4px 14px rgb(15 23 42 / 0.06);
+}
+
+@keyframes anim-modern-view-in {
+  from {
+    opacity: 0;
+    transform: translate3d(0, 5px, 0);
+  }
+  to {
+    opacity: 1;
+    transform: translate3d(0, 0, 0);
+  }
+}
+
+@keyframes anim-modern-pop-in {
+  from {
+    opacity: 0;
+    transform: translateY(-4px) scale(0.975);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes anim-modern-pop-in-up {
+  from {
+    opacity: 0;
+    transform: translateY(4px) scale(0.975);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes anim-modern-tip-fade {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes anim-modern-step-row-in {
+  0% {
+    opacity: 0;
+    background-color: transparent;
+    animation-timing-function: cubic-bezier(0.22, 1, 0.36, 1);
+  }
+  20% {
+    opacity: 0.84;
+    background-color: color-mix(in srgb, var(--accent-primary) 7.5%, transparent);
+    animation-timing-function: ease-out;
+  }
+  36% {
+    opacity: 1;
+    background-color: color-mix(in srgb, var(--accent-primary) 6%, transparent);
+    animation-timing-function: cubic-bezier(0.4, 0, 0.2, 1);
+  }
+  70% {
+    opacity: 1;
+    background-color: color-mix(in srgb, var(--accent-primary) 2%, transparent);
+    animation-timing-function: ease-out;
+  }
+  100% {
+    opacity: 1;
+    background-color: transparent;
+  }
+}
+
+@keyframes anim-modern-step-cell-in {
+  from {
+    transform: translate3d(0, -3px, 0);
+  }
+  to {
+    transform: translate3d(0, 0, 0);
+  }
+}
+
+@keyframes anim-modern-pill-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+/* --- 1. 外壳画布、顶层卡片与按量贴合滑动轨道 (Canvas, Top-Level Cards & Fit-Content Sliding Tracks) --- */
+html[data-standalone="true"][data-modern-ui="true"] #app-root {
+  min-height: 100dvh;
+  background: var(--modern-canvas-bg);
+}
+
+html[data-standalone="true"][data-modern-ui="true"] .app-shell {
+  border-left: none;
+  border-right: none;
+}
+
+[data-modern-ui="true"] .app-shell {
+  background: var(--modern-canvas-bg);
+}
+
+[data-modern-ui="true"] .view-pane {
+  animation: anim-modern-view-in 220ms var(--ease-modern);
+}
+
+[data-modern-ui="true"] .panel,
+[data-modern-ui="true"] .session-header {
+  border: none;
+  background: var(--modern-surface-card);
+  box-shadow: var(--modern-card-shadow);
+}
+
+[data-modern-ui="true"] .panel .panel {
+  background: var(--modern-surface-subtle);
+  box-shadow: none;
+}
+
+[data-modern-ui="true"] .long-pill-nav,
+[data-modern-ui="true"] .settings-thirdnav-bar {
+  border: none;
+  background: var(--modern-nav-track-bg);
+}
+
+[data-modern-ui="true"] .settings-subnav-bar {
+  padding: 0;
+  border: none;
+  background: transparent;
+}
+
+[data-modern-ui="true"] .segmented {
+  padding: 2px;
+  border-radius: var(--radius-xs);
+  background: var(--modern-inline-track-bg);
+}
+
+[data-modern-ui="true"] .settings-subnav-bar .segmented {
+  padding: 3px;
+  border-radius: var(--radius-sm);
+  background: var(--modern-nav-track-bg);
+}
+
+[data-modern-ui="true"] .pill-glider {
+  border: none;
+  background: var(--modern-glider-bg);
+  box-shadow: var(--modern-glider-shadow);
+  transition: transform 230ms var(--ease-modern);
+}
+
+[data-modern-ui="true"] .seg-glider {
+  border: none;
+  background: var(--modern-glider-bg);
+  box-shadow: var(--modern-glider-shadow);
+}
+
+[data-modern-ui="true"] .seg-glider.is-ready {
+  transition:
+    transform 220ms var(--ease-modern),
+    width 220ms var(--ease-modern),
+    height 180ms var(--ease-modern);
+}
+
+[data-modern-ui="true"] .segmented:not(.has-glider) .seg-btn.is-active {
+  background: var(--modern-glider-bg);
+  box-shadow: var(--modern-glider-shadow);
+}
+
+[data-modern-ui="true"] .thirdnav-glider {
+  border: none;
+  background: var(--modern-glider-bg);
+  box-shadow: var(--modern-glider-shadow);
+  transition: transform 220ms var(--ease-modern);
+}
+
+[data-modern-ui="true"] .pill-tab,
+[data-modern-ui="true"] .seg-btn,
+[data-modern-ui="true"] .structure-thirdnav-btn {
+  transition:
+    color 160ms var(--ease-modern),
+    transform 140ms var(--ease-modern);
+}
+
+[data-modern-ui="true"] .pill-tab:active,
+[data-modern-ui="true"] .seg-btn:active,
+[data-modern-ui="true"] .structure-thirdnav-btn:active {
+  transform: scale(0.97);
+}
+
+/* --- 2. 按钮、状态标签、代理徽章与胶囊全面去边框 --- */
+[data-modern-ui="true"] .status-tag,
+[data-modern-ui="true"] .status-tag.state-running,
+[data-modern-ui="true"] .status-tag.state-synced,
+[data-modern-ui="true"] .status-tag.state-warn,
+[data-modern-ui="true"] .update-badge-btn,
+[data-modern-ui="true"] .wm-update-btn,
+[data-modern-ui="true"] .wm-hover-update-bar,
+:host([data-modern-ui="true"]) .wm-update-btn {
+  border: none;
+}
+
+[data-modern-ui="true"] .icon-btn,
+[data-modern-ui="true"] .btn-secondary,
+[data-modern-ui="true"] .btn-ghost-sm,
+[data-modern-ui="true"] .live-sub-toggle,
+[data-modern-ui="true"] .ctx-agent-pill,
+[data-modern-ui="true"] .theme-host-chip,
+[data-modern-ui="true"] .collapsible-badge {
+  border: none;
+  background: var(--modern-surface-subtle);
+  transition:
+    background-color 160ms var(--ease-modern),
+    color 160ms var(--ease-modern),
+    transform 140ms var(--ease-modern);
+}
+
+[data-modern-ui="true"] .session-header .icon-btn {
+  background: var(--modern-surface-subtle);
+}
+
+[data-modern-ui="true"] .icon-btn:hover,
+[data-modern-ui="true"] .btn-secondary:hover:not(:disabled),
+[data-modern-ui="true"] .btn-ghost-sm:hover:not(:disabled),
+[data-modern-ui="true"] .live-sub-toggle:hover,
+[data-modern-ui="true"] .ctx-agent-pill:hover,
+[data-modern-ui="true"] .theme-host-chip:hover {
+  border: none;
+  background: var(--modern-surface-hover);
+}
+
+[data-modern-ui="true"] .pill-tab.is-active,
+[data-modern-ui="true"] .pill-tab.is-active .svg-icon,
+[data-modern-ui="true"] .pill-tab.is-active .pill-tab-badge,
+[data-modern-ui="true"] .seg-btn.is-active,
+[data-modern-ui="true"] .structure-thirdnav-btn.is-active {
+  color: var(--modern-active-accent);
+}
+
+[data-modern-ui="true"] .live-sub-toggle.is-expanded,
+[data-modern-ui="true"] .ctx-agent-pill.is-active,
+[data-modern-ui="true"] .theme-host-chip.is-active {
+  border: none;
+  color: var(--modern-active-accent);
+  background: var(--accent-primary-soft);
+}
+
+[data-modern-ui="true"] .ctx-agent-pill.is-more-toggle {
+  color: var(--text-secondary);
+}
+
+[data-modern-ui="true"] .btn-ghost-sm:disabled {
+  opacity: 0.54;
+}
+
+[data-modern-ui="true"] .live-sub-row.is-done {
+  opacity: 0.82;
+}
+
+[data-modern-ui="true"] .live-sub-row.is-waiting-sub {
+  opacity: 0.92;
+}
+
+[data-modern-ui="true"] .live-sub-row.is-killed-sub {
+  opacity: 0.68;
+}
+
+[data-modern-ui="true"] .live-sub-toggle-chevron,
+[data-modern-ui="true"] .ctx-toggle-chevron {
+  transition: transform 200ms var(--ease-modern);
+}
+
+[data-modern-ui="true"] .ctx-agent-pill.is-pill-entering {
+  animation: anim-modern-pill-in 180ms ease-out both;
+}
+
+[data-modern-ui="true"] .ctx-agent-pill.is-pill-collapsing {
+  opacity: 0;
+  transition: opacity 150ms ease-out;
+}
+
+[data-modern-ui="true"] .btn-primary {
+  border: none;
+  transition:
+    opacity 160ms var(--ease-modern),
+    transform 140ms var(--ease-modern);
+}
+
+[data-modern-ui="true"] .agent-badge,
+[data-modern-ui="true"] .agent-badge.is-clickable:hover,
+[data-modern-ui="true"] .step-anomaly-tag {
+  border: none;
+}
+
+[data-modern-ui="true"] .agent-badge:not(.badge-main):not([class*="badge-sub-"]) {
+  background: var(--modern-surface-subtle);
+}
+
+/* --- 3. 实时概览矩阵与任务卡片：顶层独立卡片，面板内子块绝不叠套背景 --- */
+[data-modern-ui="true"] .telemetry-matrix {
+  border: none;
+  background: transparent;
+  gap: 6px;
+  overflow: visible;
+}
+
+[data-modern-ui="true"] .matrix-cell {
+  background: var(--modern-surface-card);
+  box-shadow: var(--modern-card-shadow);
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+  transition: background-color 160ms var(--ease-modern);
+}
+
+/* 面板内的双栏信息项（如版本更新中的「价格表 / 当前版本」）不套二层背景 */
+[data-modern-ui="true"] .dual-grid > .matrix-cell {
+  background: transparent;
+  box-shadow: none;
+  border-radius: 0;
+  padding: 2px 0;
+}
+
+/* 结构页预览画布内的测速卡与任务卡保持轻微层次以呈现真实预览布局 */
+[data-modern-ui="true"] .structure-preview-canvas .matrix-cell {
+  background: var(--modern-surface-subtle);
+  box-shadow: none;
+  border-radius: var(--radius-xs);
+}
+
+[data-modern-ui="true"] .live-task-card {
+  border: none;
+  background: var(--modern-surface-card);
+  box-shadow: var(--modern-card-shadow);
+  border-radius: var(--radius-sm);
+}
+
+[data-modern-ui="true"] .structure-preview-canvas .live-task-card {
+  background: var(--modern-surface-subtle);
+  box-shadow: none;
+  border-radius: var(--radius-xs);
+}
+
+[data-modern-ui="true"] .live-sub-scroll-host {
+  border-top: none;
+  padding-top: 6px;
+}
+
+[data-modern-ui="true"] .live-sub-scroll-host.is-sub-animating > .scrollbar-rail {
+  opacity: 0 !important;
+  pointer-events: none;
+}
+
+[data-modern-ui="true"] .progress-track {
+  border-radius: var(--radius-pill);
+  background: var(--modern-progress-track);
+}
+
+[data-modern-ui="true"] .progress-track.ctx-segment-meter {
+  height: 6px;
+  border-radius: 3px;
+  background: var(--modern-progress-track);
+}
+
+/* --- 4. 用量统计矩阵、热力格与详情卡去边框且不叠内层背景 --- */
+[data-modern-ui="true"] .cons-box,
+[data-modern-ui="true"] .cons-custom-range-bar {
+  border: none;
+  background: transparent;
+}
+
+[data-modern-ui="true"] .dt-popover .icon-btn {
+  background: transparent;
+}
+
+[data-modern-ui="true"] .dt-popover .icon-btn:hover {
+  background: var(--modern-surface-hover);
+}
+
+[data-modern-ui="true"] .cons-unified-matrix {
+  border: none;
+  background: transparent;
+  gap: 10px 12px;
+  padding: 2px 0;
+  overflow: visible;
+}
+
+[data-modern-ui="true"] .cons-split-3 {
+  gap: 12px;
+}
+
+[data-modern-ui="true"] .cons-matrix-bottom {
+  border-top: none;
+}
+
+[data-modern-ui="true"] .cons-col,
+[data-modern-ui="true"] .cons-col.is-bordered-col {
+  border: none;
+  background: transparent;
+  border-radius: 0;
+  padding: 2px 0;
+}
+
+[data-modern-ui="true"] .trend-peak-pill,
+[data-modern-ui="true"] .trend-hm-cell.lv-0,
+[data-modern-ui="true"] .trend-hm-swatch.lv-0 {
+  border: none;
+}
+
+[data-modern-ui="true"] .trend-tip-sub,
+[data-modern-ui="true"] .trend-tip-anomaly,
+[data-modern-ui="true"] .cons-pop-models {
+  border-top: none;
+  padding-top: 3px;
+}
+
+[data-modern-ui="true"] .cons-source-bar-hit:hover .cons-source-model-bar,
+[data-modern-ui="true"] .cons-source-bar-hit.is-hovered .cons-source-model-bar,
+[data-modern-ui="true"] .month-col.is-interactive:hover .month-stack,
+[data-modern-ui="true"] .month-col.is-hovered .month-stack {
+  box-shadow: none;
+  filter: brightness(1.06);
+  transform: scaleY(1.06);
+}
+
+[data-modern-ui="true"] .cons-source-model-bar,
+[data-modern-ui="true"] .month-stack {
+  transition:
+    height var(--dur-normal) var(--ease-modern),
+    transform 150ms var(--ease-modern),
+    filter 150ms var(--ease-modern);
+}
+
+/* --- 5. 调用记录表格与模型分析区去横线边框且不套内层背景 --- */
+[data-modern-ui="true"] .table-scroll-host {
+  border-top: none;
+  background: transparent;
+}
+
+[data-modern-ui="true"] .table-viewport,
+[data-modern-ui="true"] .data-table th {
+  background: var(--modern-surface-card);
+}
+
+[data-modern-ui="true"] .data-table th,
+[data-modern-ui="true"] .data-table td {
+  border-bottom: none;
+}
+
+[data-modern-ui="true"] .data-table tbody tr:not(.step-vspacer):not(.step-vsizer) {
+  transition: background-color 130ms var(--ease-modern);
+}
+
+[data-modern-ui="true"] .steps-data-table tbody tr.is-step-entering {
+  animation: anim-modern-step-row-in 850ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+[data-modern-ui="true"] .steps-data-table tbody tr.is-step-entering > td {
+  animation: anim-modern-step-cell-in 300ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+[data-modern-ui="true"] .data-table:not(.is-virtualized) tbody tr:nth-child(even),
+[data-modern-ui="true"] .data-table.is-virtualized tbody tr.is-stripe-even {
+  background: var(--modern-stripe-bg);
+}
+
+[data-modern-ui="true"] .data-table tbody tr:not(.step-vspacer):not(.step-vsizer):hover,
+[data-modern-ui="true"] .data-table.is-virtualized tbody tr.is-stripe-even:hover {
+  background: var(--modern-surface-hover);
+}
+
+[data-modern-ui="true"] .data-table tbody tr.is-anomaly-warn,
+[data-modern-ui="true"] .data-table:not(.is-virtualized) tbody tr.is-anomaly-warn:nth-child(even),
+[data-modern-ui="true"] .data-table.is-virtualized tbody tr.is-stripe-even.is-anomaly-warn {
+  background: color-mix(in srgb, var(--metric-warn) 12%, transparent);
+}
+
+[data-modern-ui="true"] .data-table tbody tr.is-anomaly-warn:hover,
+[data-modern-ui="true"] .data-table.is-virtualized tbody tr.is-stripe-even.is-anomaly-warn:hover {
+  background: color-mix(in srgb, var(--metric-warn) 19%, transparent);
+}
+
+[data-modern-ui="true"] .data-table tbody tr.is-anomaly-danger,
+[data-modern-ui="true"] .data-table:not(.is-virtualized) tbody tr.is-anomaly-danger:nth-child(even),
+[data-modern-ui="true"] .data-table.is-virtualized tbody tr.is-stripe-even.is-anomaly-danger {
+  background: color-mix(in srgb, var(--metric-danger) 14%, transparent);
+}
+
+[data-modern-ui="true"] .data-table tbody tr.is-anomaly-danger:hover,
+[data-modern-ui="true"] .data-table.is-virtualized tbody tr.is-stripe-even.is-anomaly-danger:hover {
+  background: color-mix(in srgb, var(--metric-danger) 21%, transparent);
+}
+
+[data-modern-ui="true"] .steps-inline-scope-select .select-trigger,
+[data-modern-ui="true"] .steps-inline-model-select .select-trigger,
+[data-modern-ui="true"] .sstep-fit-model-select .select-trigger {
+  border: none;
+  background: var(--modern-surface-subtle);
+}
+
+[data-modern-ui="true"] .sstep-card,
+[data-modern-ui="true"] .smodel-empty {
+  border: none;
+  background: transparent;
+  padding-left: 2px;
+  padding-right: 2px;
+}
+
+[data-modern-ui="true"] .smodel-card {
+  border: none;
+  background: transparent;
+}
+
+[data-modern-ui="true"] .step-table-preview-host {
+  border: none;
+  background: var(--modern-surface-subtle);
+}
+
+[data-modern-ui="true"] .smodel-card:hover {
+  background: var(--modern-surface-hover);
+}
+
+[data-modern-ui="true"] .smodel-card.is-fit-active {
+  border: none;
+  background: var(--accent-primary-soft);
+}
+
+[data-modern-ui="true"] .steps-anomaly-filterbar,
+[data-modern-ui="true"] .steps-anomaly-strip {
+  border: none;
+  border-radius: var(--radius-xs);
+  background: var(--metric-warn-soft);
+}
+
+[data-modern-ui="true"] .steps-anomaly-filterbar {
+  margin: 4px 2px 2px;
+}
+
+[data-modern-ui="true"] .sstep-anomaly-dot,
+[data-modern-ui="true"] .sstep-scatter-dot.is-anomaly {
+  fill: var(--modern-surface-card);
+}
+
+/* --- 6. 设置表单、折叠面板、槽位排序与输入控件去边框 --- */
+[data-modern-ui="true"] .collapsible-body,
+[data-modern-ui="true"] .settings-action-block + .settings-action-block,
+[data-modern-ui="true"] .settings-account-entry,
+[data-modern-ui="true"] .dt-time-row {
+  border-top: none;
+}
+
+[data-modern-ui="true"] .settings-divider {
+  display: none;
+}
+
+[data-modern-ui="true"] .editable-slot-row,
+[data-modern-ui="true"] .editable-slot-empty,
+[data-modern-ui="true"] .structure-preview-empty,
+[data-modern-ui="true"] .preview-sidebar-note,
+[data-modern-ui="true"] .preview-capsule-bar,
+[data-modern-ui="true"] .preview-capsule-bar.is-composer .wm-multi-btn,
+[data-modern-ui="true"] .preview-capsule-bar.is-composer .wm-capsule-btn,
+[data-modern-ui="true"] .preview-composer-chip {
+  border: none;
+  background: var(--modern-surface-subtle);
+}
+
+[data-modern-ui="true"] .slot-add-btn,
+[data-modern-ui="true"] .settings-bridge-relaunch-btn {
+  border: none;
+}
+
+[data-modern-ui="true"] .ctx-risk-mask,
+[data-modern-ui="true"] .settings-bridge-notice,
+[data-modern-ui="true"] .settings-bridge-notice.is-restart {
+  border: none;
+}
+
+[data-modern-ui="true"] .number-input,
+[data-modern-ui="true"] .dt-trigger,
+[data-modern-ui="true"] .dt-mini-step,
+[data-modern-ui="true"] .settings-text-input,
+[data-modern-ui="true"] .settings-account-form input {
+  border: none;
+  background: var(--modern-surface-subtle);
+  transition:
+    background-color 150ms var(--ease-modern),
+    box-shadow 150ms var(--ease-modern);
+}
+
+[data-modern-ui="true"] .num-step-btn {
+  background: transparent;
+}
+
+[data-modern-ui="true"] .num-field {
+  border-left: none;
+  border-right: none;
+}
+
+[data-modern-ui="true"] .number-input:focus-within,
+[data-modern-ui="true"] .settings-text-input:focus,
+[data-modern-ui="true"] .settings-account-form input:focus {
+  border: none;
+  box-shadow: 0 0 0 1.5px color-mix(in srgb, var(--accent-primary) 55%, transparent);
+}
+
+/* --- 7. 全景悬浮窗与工具提示浮层：零边框 + 空气阴影 + 0.15s 平滑跟随过渡 --- */
+[data-modern-ui="true"] .select-menu,
+[data-modern-ui="true"] .dt-popover,
+[data-modern-ui="true"] .sstep-tooltip {
+  border: none;
+  background: var(--modern-surface-card);
+  box-shadow: var(--shadow-popover);
+  animation: anim-modern-pop-in 150ms var(--ease-modern);
+}
+
+[data-modern-ui="true"] .select-menu.is-above,
+[data-modern-ui="true"] .dt-popover.is-above {
+  animation-name: anim-modern-pop-in-up;
+}
+
+[data-modern-ui="true"] .trend-tooltip,
+[data-modern-ui="true"] .cons-breakdown-popover,
+[data-modern-ui="true"] .turn-prompt-tip,
+[data-modern-ui="true"] .step-anomaly-tip {
+  border: none;
+  background: var(--modern-surface-card);
+  box-shadow: var(--shadow-popover);
+  animation: anim-modern-tip-fade 150ms var(--ease-modern);
+}
+
+[data-modern-ui="true"] .step-anomaly-tip-list,
+[data-modern-ui="true"] .step-anomaly-tip-hint {
+  border-top-color: var(--modern-surface-hover);
+}
+
+[data-modern-ui="true"] .trend-tooltip:not(.is-hm-top):not(.is-hm-bottom) {
+  top: 2px;
+  bottom: auto;
+  transform: translate3d(var(--tip-shift, -50%), var(--tip-y, 0px), 0);
+}
+
+[data-modern-ui="true"] .trend-tooltip.is-tracking {
+  transition:
+    left 150ms var(--ease-modern),
+    top 150ms var(--ease-modern),
+    bottom 150ms var(--ease-modern),
+    transform 150ms var(--ease-modern);
+}
+
+[data-modern-ui="true"] .trend-hover-dot.is-tracking {
+  transition:
+    cx 150ms var(--ease-modern),
+    cy 150ms var(--ease-modern);
+}
+
+[data-modern-ui="true"] .cons-breakdown-popover.is-tracking,
+[data-modern-ui="true"] .turn-prompt-tip.is-tracking {
+  transition:
+    left 150ms var(--ease-modern),
+    top 150ms var(--ease-modern),
+    transform 150ms var(--ease-modern);
+}
+
+[data-modern-ui="true"].wm-popover-panel,
+[data-modern-ui="true"].wm-hover-tip,
+[data-modern-ui="true"].wm-multi-panel,
+:host([data-modern-ui="true"]) .wm-popover-panel,
+:host([data-modern-ui="true"]) .wm-hover-tip,
+:host([data-modern-ui="true"]) .wm-multi-panel {
+  border: none;
+  border-radius: 12px;
+  background: var(--modern-canvas-bg);
+  box-shadow: var(--shadow-overlay);
+  animation: anim-modern-pop-in 200ms var(--ease-modern);
+}
+
+[data-modern-ui="true"].wm-popover-panel.is-above,
+[data-modern-ui="true"].wm-hover-tip.is-above,
+[data-modern-ui="true"].wm-multi-panel.is-above,
+:host([data-modern-ui="true"]) .wm-popover-panel.is-above,
+:host([data-modern-ui="true"]) .wm-hover-tip.is-above,
+:host([data-modern-ui="true"]) .wm-multi-panel.is-above {
+  animation-name: anim-modern-pop-in-up;
+}
+
+[data-modern-ui="true"] .wm-multi-header,
+:host([data-modern-ui="true"]) .wm-multi-header,
+[data-modern-ui="true"].wm-multi-panel .live-task-card + .live-task-card,
+:host([data-modern-ui="true"]) .wm-multi-panel .live-task-card + .live-task-card {
+  border: none;
+}
+
+[data-modern-ui="true"].wm-multi-panel,
+:host([data-modern-ui="true"]) .wm-multi-panel {
+  background: var(--modern-surface-card);
+}
+
+[data-modern-ui="true"].wm-multi-panel .live-activity-list,
+:host([data-modern-ui="true"]) .wm-multi-panel .live-activity-list {
+  gap: 2px;
+}
+
+[data-modern-ui="true"].wm-multi-panel .live-task-card,
+:host([data-modern-ui="true"]) .wm-multi-panel .live-task-card {
+  padding: 10px 2px;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+/* --- 8. 顶栏胶囊老虎机滚动数字 (0.15s) 与语义色平滑渐变 (0.1s)，严格限定实验性新 UI --- */
+:host([data-modern-ui="true"]) .wm-cap-slot,
+:host([data-modern-ui="true"]) .wm-cap-slot .wm-slot-text,
+:host([data-modern-ui="true"]) .wm-multi-label,
+[data-modern-ui="true"] .wm-cap-slot,
+[data-modern-ui="true"] .wm-cap-slot .wm-slot-text,
+[data-modern-ui="true"] .wm-multi-label {
+  transition: color 100ms ease-out;
+}
+
+:host([data-modern-ui="true"]) .wm-ring-fill,
+[data-modern-ui="true"] .wm-ring-fill {
+  transition:
+    stroke-dashoffset var(--dur-normal) var(--ease-modern),
+    stroke 100ms ease-out;
+}
+
+:host([data-modern-ui="true"]) .wm-multi-dot,
+[data-modern-ui="true"] .wm-multi-dot {
+  transition: background-color 100ms ease-out;
+}
+
+:host([data-modern-ui="true"]) .wm-slot-text[data-od-active="1"],
+:host([data-modern-ui="true"]) .wm-multi-label[data-od-active="1"],
+[data-modern-ui="true"] .wm-slot-text[data-od-active="1"],
+[data-modern-ui="true"] .wm-multi-label[data-od-active="1"] {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 18px;
+  line-height: 18px;
+}
+
+:host([data-modern-ui="true"]) .wm-slot-text.wm-ctx-pct[data-od-active="1"],
+:host([data-modern-ui="true"]) .wm-multi-label[data-od-active="1"],
+[data-modern-ui="true"] .wm-slot-text.wm-ctx-pct[data-od-active="1"],
+[data-modern-ui="true"] .wm-multi-label[data-od-active="1"] {
+  justify-content: flex-start;
+}
+
+:host([data-modern-ui="true"]) .wm-od-digit,
+[data-modern-ui="true"] .wm-od-digit {
+  display: inline-block;
+  position: relative;
+  height: 18px;
+  line-height: 18px;
+  overflow: hidden;
+  vertical-align: top;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
+:host([data-modern-ui="true"]) .wm-od-track,
+[data-modern-ui="true"] .wm-od-track {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  transform: translate3d(0, calc(var(--od-val, 0) * -18px), 0);
+  transition: transform 150ms cubic-bezier(0.22, 1, 0.36, 1);
+  will-change: transform;
+}
+
+:host([data-modern-ui="true"]) .wm-od-cell,
+[data-modern-ui="true"] .wm-od-cell {
+  display: block;
+  height: 18px;
+  line-height: 18px;
+  flex-shrink: 0;
+}
+
+:host([data-modern-ui="true"]) .wm-od-static,
+[data-modern-ui="true"] .wm-od-static {
+  display: inline-block;
+  height: 18px;
+  line-height: 18px;
+  vertical-align: top;
+  white-space: pre;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :host([data-modern-ui="true"]) .wm-od-track,
+  [data-modern-ui="true"] .wm-od-track,
+  :host([data-modern-ui="true"]) .wm-cap-slot,
+  :host([data-modern-ui="true"]) .wm-cap-slot .wm-slot-text,
+  :host([data-modern-ui="true"]) .wm-multi-label,
+  :host([data-modern-ui="true"]) .wm-ring-fill,
+  :host([data-modern-ui="true"]) .wm-multi-dot,
+  [data-modern-ui="true"] .wm-cap-slot,
+  [data-modern-ui="true"] .wm-cap-slot .wm-slot-text,
+  [data-modern-ui="true"] .wm-multi-label,
+  [data-modern-ui="true"] .wm-ring-fill,
+  [data-modern-ui="true"] .wm-multi-dot {
+    transition: none !important;
+  }
+}

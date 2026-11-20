@@ -4,8 +4,19 @@
  * (Sidecar Webview `window.sidecar.fetch` + Main Window Loopback Bridge).
  */
 
+import { readInjectedWindowBridge } from '../../shared/window-bridge-protocol.mjs';
+
 const inFlightGets = new Map();
 const activeControllers = new Map();
+
+export function abortSidecarApiKey(abortKey) {
+  if (!abortKey) return;
+  const prev = activeControllers.get(abortKey);
+  if (prev) {
+    activeControllers.delete(abortKey);
+    prev.abort();
+  }
+}
 
 /**
  * 读取主窗口双栖模式下注入的本地桥接配置（`port`、`token`、`bundleVersion`、`stylesCss`）。
@@ -13,8 +24,7 @@ const activeControllers = new Map();
  * @returns {{ port: number, token: string, bundleVersion?: string, stylesCss?: string } | null}
  */
 export function getWindowBridgeConfig() {
-  if (typeof window === 'undefined') return null;
-  const br = window.__AGUsageMonitorBridge;
+  const br = readInjectedWindowBridge();
   const port = Number(br?.port || 0);
   if (br && Number.isInteger(port) && port > 0 && typeof br.token === 'string' && br.token) {
     return br;
@@ -57,7 +67,7 @@ export function deliverCdpBridgeResponses(responses) {
   return delivered;
 }
 
-function callViaCdpBridge(bridge, path, { method, body, signal }) {
+function callViaCdpBridge(bridge, path, { method, body, signal, cdpTimeoutMs }) {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) {
       const abortErr = new Error('Request aborted');
@@ -79,7 +89,7 @@ function callViaCdpBridge(bridge, path, { method, body, signal }) {
       bridge.rpcPending.delete(reqId);
       cleanupQueueItem();
       reject(new Error('CDP bridge timeout'));
-    }, 8000);
+    }, cdpTimeoutMs);
 
     const onAbort = () => {
       clearTimeout(timeoutId);
@@ -118,7 +128,7 @@ function callViaCdpBridge(bridge, path, { method, body, signal }) {
   });
 }
 
-export async function callSidecarApi(path, { method = 'GET', body, abortKey = '' } = {}) {
+export async function callSidecarApi(path, { method = 'GET', body, abortKey = '', cdpTimeoutMs = 3500 } = {}) {
   const upperMethod = method.toUpperCase();
   const dedupKey = upperMethod === 'GET' && !abortKey ? path : '';
 
@@ -138,43 +148,27 @@ export async function callSidecarApi(path, { method = 'GET', body, abortKey = ''
     signal = requestController.signal;
   }
 
-  const runRequest = async () => {
+  const execHttpOnce = async (activeBridge) => {
     const sidecar = typeof window !== 'undefined' ? window.sidecar : null;
-    const bridge = !sidecar?.fetch ? getWindowBridgeConfig() : null;
     const fetchFn = sidecar?.fetch
       ? sidecar.fetch.bind(sidecar)
       : typeof window !== 'undefined' && typeof window.fetch === 'function'
         ? window.fetch.bind(window)
         : globalThis.fetch.bind(globalThis);
-
-    const requestUrl = bridge ? `http://127.0.0.1:${bridge.port}${path}` : path;
+    const requestUrl = activeBridge ? `http://127.0.0.1:${activeBridge.port}${path}` : path;
     const headers = {};
-    if (body !== undefined || !bridge) {
+    if (body !== undefined || !activeBridge) {
       headers['Content-Type'] = 'application/json';
     }
-    if (bridge) {
-      headers['X-Usage-Monitor-Token'] = bridge.token;
-      if (bridge.transportMode === 'cdp') {
-        return callViaCdpBridge(bridge, path, { method: upperMethod, body, signal });
-      }
+    if (activeBridge) {
+      headers['X-Usage-Monitor-Token'] = activeBridge.token;
     }
-
-    let res;
-    try {
-      res = await fetchFn(requestUrl, {
-        method: upperMethod,
-        headers,
-        body: body === undefined ? undefined : JSON.stringify(body),
-        signal,
-      });
-    } catch (fetchErr) {
-      if (!bridge || signal?.aborted || fetchErr?.name === 'AbortError') {
-        throw fetchErr;
-      }
-      // 当宿主环境的 CSP connect-src、混合内容策略或本地代理阻断 HTTP 直连时，无缝切至 CDP 通道
-      bridge.transportMode = 'cdp';
-      return callViaCdpBridge(bridge, path, { method: upperMethod, body, signal });
-    }
+    const res = await fetchFn(requestUrl, {
+      method: upperMethod,
+      headers,
+      body: body === undefined ? undefined : JSON.stringify(body),
+      signal,
+    });
     if (signal?.aborted) {
       const abortErr = new Error('Request aborted');
       abortErr.name = 'AbortError';
@@ -189,7 +183,58 @@ export async function callSidecarApi(path, { method = 'GET', body, abortKey = ''
     if (!res.ok) {
       throw new Error(data.error || `HTTP ${res.status}`);
     }
+    if (activeBridge) {
+      activeBridge.transportMode = 'http';
+    }
     return data;
+  };
+
+  const fallbackViaCdpWithRecovery = async (initialBridge) => {
+    initialBridge.transportMode = 'cdp';
+    try {
+      return await callViaCdpBridge(initialBridge, path, {
+        method: upperMethod,
+        body,
+        signal,
+        cdpTimeoutMs,
+      });
+    } catch (cdpErr) {
+      if (signal?.aborted || cdpErr?.name === 'AbortError') {
+        throw cdpErr;
+      }
+      // 热更新或守护重启期间若 CDP 尚未轮询投递，自动重置回 HTTP 并用最新桥接端口重试一次
+      const latestBridge = getWindowBridgeConfig() || initialBridge;
+      latestBridge.transportMode = 'http';
+      return execHttpOnce(latestBridge);
+    }
+  };
+
+  const runRequest = async () => {
+    const sidecar = typeof window !== 'undefined' ? window.sidecar : null;
+    const bridge = !sidecar?.fetch ? getWindowBridgeConfig() : null;
+    if (bridge && bridge.transportMode === 'cdp') {
+      return fallbackViaCdpWithRecovery(bridge);
+    }
+
+    try {
+      return await execHttpOnce(bridge);
+    } catch (fetchErr) {
+      if (signal?.aborted || fetchErr?.name === 'AbortError') {
+        throw fetchErr;
+      }
+      if (!bridge) {
+        // 辅助栏 Webview 在 Worker 热替换瞬间若有极短暂波动，延迟 180ms 自动无感重试一次
+        if (upperMethod === 'GET') {
+          await new Promise((r) => setTimeout(r, 180));
+          if (!signal?.aborted) {
+            return execHttpOnce(null);
+          }
+        }
+        throw fetchErr;
+      }
+      // 当宿主环境的 CSP connect-src、混合内容策略或瞬态端口切换阻断直连时，切至带 HTTP 自愈恢复的 CDP 通道
+      return fallbackViaCdpWithRecovery(bridge);
+    }
   };
 
   const promise = runRequest().finally(() => {

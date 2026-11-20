@@ -11,7 +11,7 @@
 
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
-import { parseIsoMs } from '../speed-metrics.mjs';
+import { parseIsoMs } from '../trajectory-metrics.mjs';
 import {
   DEFAULT_ARCHIVE_FALLBACK_URL,
   DEFAULT_DOWNLOAD_URL,
@@ -23,6 +23,7 @@ import {
   PLUGIN_ROOT,
   REMOTE_CATALOG_CACHE_FILE,
   cloudSyncState,
+  detectCustomGitForkRepo,
   loadJson,
   pluginUpdateState,
 } from './config.mjs';
@@ -32,6 +33,25 @@ import {
  */
 export const MODEL_PRICING = {};
 export const PLACEHOLDER_MAP = {};
+export let pricingCatalogRevision = 0;
+let pricingPhaseBoundariesMs = [];
+
+/**
+ * 返回给定时刻已跨过的全局价格阶段边界计数，供遥测与聚合快照在跨越优惠截止时间点时自动失效重算。
+ *
+ * @param {number} [atMs=Date.now()]
+ * @returns {number}
+ */
+export function getPricingPhaseEpoch(atMs = Date.now()) {
+  const t = Number(atMs);
+  if (!Number.isFinite(t) || t <= 0 || pricingPhaseBoundariesMs.length === 0) return 0;
+  let epoch = 0;
+  for (let i = 0; i < pricingPhaseBoundariesMs.length; i++) {
+    if (t >= pricingPhaseBoundariesMs[i]) epoch = i + 1;
+    else break;
+  }
+  return epoch;
+}
 
 /**
  * 校验字符串是否为合法的 SemVer 2.0 语义化版本号格式（支持 `-prerelease` 与 `+build` 元数据）。
@@ -188,13 +208,7 @@ function normalizeModelFamily(rawFamily) {
   return f;
 }
 
-/**
- * 校验单条模型价格配置是否合法：
- * - `input`/`cache`/`output` 必须为原生 `number` 类型（阻止 `Number(null) === 0` 或 `Number("") === 0` 的隐式转换漏洞）；
- * - 数值必须非负且 `<= 10000`，且至少 `input > 0` 或 `output > 0`（拒绝全 0 伪价格将未定价模型篡改为 $0.00）；
- * - `short`/`family` 必须为非空字符串。
- */
-function isValidPricingEntry(entry) {
+function isValidPricingRateTriplet(entry) {
   if (!entry || typeof entry !== 'object') return false;
   if (
     typeof entry.input !== 'number' ||
@@ -208,6 +222,52 @@ function isValidPricingEntry(entry) {
   if (!Number.isFinite(cache) || cache < 0 || cache > 10000) return false;
   if (!Number.isFinite(output) || output < 0 || output > 10000) return false;
   if (input === 0 && output === 0) return false;
+  return true;
+}
+
+/**
+ * 校验并归一化单个时间阶段单价配置（左闭右开 `[fromMs, untilMs)`）。
+ * 至少需声明合法的 `from` 或 `until` ISO 时间戳，且若同时声明须满足 `fromMs < untilMs`。
+ */
+function sanitizePricingPhase(rawPhase) {
+  if (!isValidPricingRateTriplet(rawPhase)) return null;
+  let from = null;
+  let fromMs = -Infinity;
+  if (rawPhase.from !== undefined && rawPhase.from !== null) {
+    if (typeof rawPhase.from !== 'string' || !rawPhase.from.trim()) return null;
+    const parsedFrom = parseIsoMs(rawPhase.from.trim());
+    if (!parsedFrom || parsedFrom <= 0) return null;
+    from = rawPhase.from.trim();
+    fromMs = parsedFrom;
+  }
+  let until = null;
+  let untilMs = Infinity;
+  if (rawPhase.until !== undefined && rawPhase.until !== null) {
+    if (typeof rawPhase.until !== 'string' || !rawPhase.until.trim()) return null;
+    const parsedUntil = parseIsoMs(rawPhase.until.trim());
+    if (!parsedUntil || parsedUntil <= 0) return null;
+    until = rawPhase.until.trim();
+    untilMs = parsedUntil;
+  }
+  if (from === null && until === null) return null;
+  if (fromMs >= untilMs) return null;
+  return {
+    ...(from !== null ? { from, fromMs } : {}),
+    ...(until !== null ? { until, untilMs } : {}),
+    input: rawPhase.input,
+    cache: rawPhase.cache,
+    output: rawPhase.output,
+  };
+}
+
+/**
+ * 校验单条模型价格配置是否合法：
+ * - `input`/`cache`/`output` 必须为原生 `number` 类型（阻止 `Number(null) === 0` 或 `Number("") === 0` 的隐式转换漏洞）；
+ * - 数值必须非负且 `<= 10000`，且至少 `input > 0` 或 `output > 0`（拒绝全 0 伪价格将未定价模型篡改为 $0.00）；
+ * - `short`/`family` 必须为非空字符串。
+ */
+function isValidPricingEntry(entry) {
+  if (!isValidPricingRateTriplet(entry)) return false;
   if (typeof entry.short !== 'string' || !entry.short.trim()) return false;
   if (typeof entry.family !== 'string' || !entry.family.trim()) return false;
   return true;
@@ -238,12 +298,20 @@ export function sanitizeCatalogPayload(raw) {
     for (const [k, v] of Object.entries(raw.pricing)) {
       const key = String(k || '').trim();
       if (!key || !isValidPricingEntry(v)) continue;
+      let phases = null;
+      if (Array.isArray(v.phases)) {
+        const cleanedPhases = v.phases.map(sanitizePricingPhase).filter(Boolean);
+        if (cleanedPhases.length > 0) {
+          phases = cleanedPhases;
+        }
+      }
       pricing[key] = {
         input: v.input,
         cache: v.cache,
         output: v.output,
         short: String(v.short).trim(),
         family: normalizeModelFamily(v.family),
+        ...(phases ? { phases } : {}),
       };
       validPricingCount++;
     }
@@ -331,10 +399,18 @@ export function rebuildActiveCatalog() {
   let catalogVersion = 'builtin';
   let updatedAt = null;
   const installedVersion = readInstalledPluginVersion();
+  const customForkRepo = detectCustomGitForkRepo();
+  const customForkPrefix = customForkRepo ? `/${customForkRepo.toLowerCase()}` : '';
   let latestPluginVersion = installedVersion;
-  let releaseUrl = DEFAULT_RELEASE_URL;
-  let downloadUrl = DEFAULT_DOWNLOAD_URL;
-  let archiveFallbackUrl = DEFAULT_ARCHIVE_FALLBACK_URL;
+  let releaseUrl = customForkRepo
+    ? `https://github.com/${customForkRepo}/releases/latest`
+    : DEFAULT_RELEASE_URL;
+  let downloadUrl = customForkRepo
+    ? `https://github.com/${customForkRepo}/releases/latest/download/usage-monitor.zip`
+    : DEFAULT_DOWNLOAD_URL;
+  let archiveFallbackUrl = customForkRepo
+    ? `https://codeload.github.com/${customForkRepo}/zip/refs/heads/main`
+    : DEFAULT_ARCHIVE_FALLBACK_URL;
 
   for (const { kind, cat } of layers) {
     Object.assign(nextPricing, cat.pricing);
@@ -344,23 +420,42 @@ export function rebuildActiveCatalog() {
     }
     if (cat.catalogVersion) catalogVersion = cat.catalogVersion;
     if (cat.updatedAt) updatedAt = cat.updatedAt;
-    if (cat.latestPluginVersion) {
-      // 以当前更高优先级层的 latestPluginVersion 为准，但永不低于本地已安装版本
+    const isFromCustomFork = Boolean(
+      customForkPrefix &&
+        typeof cat.sourceUrl === 'string' &&
+        cat.sourceUrl.toLowerCase().includes(customForkPrefix)
+    );
+    const shouldAcceptCatalogReleaseMeta = !customForkRepo || isFromCustomFork;
+    if (shouldAcceptCatalogReleaseMeta && cat.latestPluginVersion) {
+      // 以当前更高优先级层的 latestPluginVersion 为准，但永不低于本地已安装版本；自定义 Fork 忽略上游版本号
       latestPluginVersion =
         compareSemver(cat.latestPluginVersion, installedVersion) > 0
           ? cat.latestPluginVersion
           : installedVersion;
     }
-    if (cat.hasReleaseUrl) releaseUrl = cat.releaseUrl;
-    if (cat.hasDownloadUrl) downloadUrl = cat.downloadUrl;
-    if (cat.hasArchiveFallbackUrl) archiveFallbackUrl = cat.archiveFallbackUrl;
+    if (shouldAcceptCatalogReleaseMeta) {
+      if (cat.hasReleaseUrl) releaseUrl = cat.releaseUrl;
+      if (cat.hasDownloadUrl) downloadUrl = cat.downloadUrl;
+      if (cat.hasArchiveFallbackUrl) archiveFallbackUrl = cat.archiveFallbackUrl;
+    }
   }
 
   for (const k of Object.keys(MODEL_PRICING)) delete MODEL_PRICING[k];
   Object.assign(MODEL_PRICING, nextPricing);
 
+  const boundarySet = new Set();
+  for (const entry of Object.values(nextPricing)) {
+    if (!Array.isArray(entry?.phases)) continue;
+    for (const ph of entry.phases) {
+      if (Number.isFinite(ph.fromMs) && ph.fromMs > 0) boundarySet.add(ph.fromMs);
+      if (Number.isFinite(ph.untilMs) && ph.untilMs > 0) boundarySet.add(ph.untilMs);
+    }
+  }
+  pricingPhaseBoundariesMs = Array.from(boundarySet).sort((a, b) => a - b);
+
   for (const k of Object.keys(PLACEHOLDER_MAP)) delete PLACEHOLDER_MAP[k];
   Object.assign(PLACEHOLDER_MAP, nextPlaceholders);
+  pricingCatalogRevision += 1;
 
   cloudSyncState.source = activeSource;
   cloudSyncState.catalogVersion = catalogVersion;

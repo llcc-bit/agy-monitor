@@ -6,7 +6,7 @@
 
 export function defineComponent({ name, setup }) {
   return function createInstance(initialProps = {}) {
-    let props = { ...initialProps };
+    const props = { ...initialProps };
     const cleanups = [];
 
     function emit(event, payload) {
@@ -30,7 +30,7 @@ export function defineComponent({ name, setup }) {
     let setupResult = null;
 
     function setProps(nextProps = {}) {
-      props = { ...props, ...nextProps };
+      Object.assign(props, nextProps);
       if (setupResult && typeof setupResult.onPropsChange === 'function') {
         setupResult.onPropsChange(props);
       }
@@ -41,6 +41,7 @@ export function defineComponent({ name, setup }) {
     }
 
     setupResult = setup({
+      props,
       getProps: () => props,
       setProps,
       emit,

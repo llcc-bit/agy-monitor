@@ -1,8 +1,8 @@
 {
   "name": "agy-monitor",
   "displayName": "AGY Monitor",
-  "version": "1.4.5",
-  "description": "实时查看输入框下方吐字速率、生成速度、首字延迟、上下文占用、可用额度及历史用量（基于 antigravity-usage-monitor 二次开发）。",
+  "version": "1.5.2",
+  "description": "实时查看输入框下方纯解码速率、生成速度、首字延迟、上下文占用、可用额度及历史用量（基于 antigravity-usage-monitor 二次开发）。",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [
     "打开用量监控面板",

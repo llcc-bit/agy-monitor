@@ -7,6 +7,7 @@
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { Script } from 'node:vm';
 
 const PANEL_DIR = dirname(dirname(fileURLToPath(import.meta.url)));
 
@@ -93,18 +94,18 @@ function consumeTrailingStatementEnd(source, startIdx) {
   return idx;
 }
 
-function scanImportDeclarationEnd(source, afterImportIdx) {
+function scanImportDeclarationEnd(source, afterImportIdx, onImport) {
   let idx = afterImportIdx;
   let braceDepth = 0;
-  let sawModuleSpecifierString = false;
   while (idx < source.length) {
     const ch = source[idx];
     if (ch === "'" || ch === '"') {
-      idx = skipSimpleString(source, idx);
+      const end = skipSimpleString(source, idx);
       if (braceDepth === 0) {
-        sawModuleSpecifierString = true;
-        return consumeTrailingStatementEnd(source, idx);
+        onImport?.(source.slice(idx + 1, end - 1), source.slice(afterImportIdx, idx));
+        return consumeTrailingStatementEnd(source, end);
       }
+      idx = end;
       continue;
     }
     if (ch === '/' && source[idx + 1] === '/') {
@@ -122,17 +123,17 @@ function scanImportDeclarationEnd(source, afterImportIdx) {
     else if (ch === '}') braceDepth = Math.max(0, braceDepth - 1);
     else if (ch === ';' && braceDepth === 0) {
       return consumeTrailingStatementEnd(source, idx);
-    } else if (ch === '\n' && braceDepth === 0 && sawModuleSpecifierString) {
-      return idx + 1;
     }
     idx += 1;
   }
   return source.length;
 }
 
-function scanExportClauseEnd(source, afterExportIdx) {
+function scanExportClauseEnd(source, afterExportIdx, onImport, onExport) {
   let idx = afterExportIdx;
+  let braceBody = '';
   if (source[idx] === '{') {
+    const bodyStart = idx + 1;
     let depth = 1;
     idx += 1;
     while (idx < source.length && depth > 0) {
@@ -156,6 +157,7 @@ function scanExportClauseEnd(source, afterExportIdx) {
       else if (ch === '}') depth -= 1;
       idx += 1;
     }
+    braceBody = source.slice(bodyStart, Math.max(bodyStart, idx - 1));
   } else if (source[idx] === '*') {
     idx += 1;
     idx = skipSpacesAndComments(source, idx);
@@ -169,10 +171,44 @@ function scanExportClauseEnd(source, afterExportIdx) {
   if (source.startsWith('from', peekFrom) && !isIdentPart(source[peekFrom + 4])) {
     const specIdx = skipSpacesAndComments(source, peekFrom + 4);
     if (source[specIdx] === "'" || source[specIdx] === '"') {
-      idx = skipSimpleString(source, specIdx);
+      const specEnd = skipSimpleString(source, specIdx);
+      const specifier = source.slice(specIdx + 1, specEnd - 1);
+      onImport?.(specifier, braceBody ? `{ ${braceBody} } from` : '');
+      idx = specEnd;
+      return consumeTrailingStatementEnd(source, idx);
+    }
+  }
+
+  if (braceBody && onExport) {
+    const cleaned = braceBody.replace(/\/\*[\s\S]*?\*\/|\/\/[^\r\n]*/g, ' ');
+    for (const part of cleaned.split(',')) {
+      const tok = part.trim();
+      if (!tok) continue;
+      const asMatch = /^([$_\w]+)\s+as\s+([$_\w]+)$/.exec(tok);
+      onExport(asMatch ? asMatch[2] : tok, true);
     }
   }
   return consumeTrailingStatementEnd(source, idx);
+}
+
+function recordExportedDeclarationIdent(source, declKeywordIdx, onExport) {
+  if (!onExport) return;
+  let pos = declKeywordIdx;
+  if (source.startsWith('async', pos) && !isIdentPart(source[pos + 5])) {
+    pos = skipSpacesAndComments(source, pos + 5);
+  }
+  for (const kw of ['const', 'let', 'var', 'function', 'class']) {
+    if (source.startsWith(kw, pos) && !isIdentPart(source[pos + kw.length])) {
+      pos = skipSpacesAndComments(source, pos + kw.length);
+      if (source[pos] === '*') pos = skipSpacesAndComments(source, pos + 1);
+      if (isIdentStart(source[pos])) {
+        let end = pos + 1;
+        while (end < source.length && isIdentPart(source[end])) end += 1;
+        onExport(source.slice(pos, end), false);
+      }
+      return;
+    }
+  }
 }
 
 /**
@@ -181,9 +217,11 @@ function scanExportClauseEnd(source, afterExportIdx) {
  * literals, removing only true top-level `import` / `export` syntax.
  *
  * @param {string} source
+ * @param {(specifier: string, clause: string) => void} [onImport]
+ * @param {(name: string, isClauseExport: boolean) => void} [onExport]
  * @returns {string}
  */
-export function stripModuleSyntax(source) {
+export function stripModuleSyntax(source, onImport, onExport) {
   const len = source.length;
   let out = '';
   let i = 0;
@@ -356,7 +394,7 @@ export function stripModuleSyntax(source) {
         const nextCh = source[afterImport];
         // Exclude `import.meta` and dynamic `import(...)`
         if (nextCh && nextCh !== '.' && nextCh !== '(') {
-          i = scanImportDeclarationEnd(source, afterImport);
+          i = scanImportDeclarationEnd(source, afterImport, onImport);
           canStartRegex = true;
           prevNonWsChar = ';';
           continue;
@@ -367,7 +405,7 @@ export function stripModuleSyntax(source) {
         const afterExport = skipSpacesAndComments(source, end);
         const nextCh = source[afterExport];
         if (nextCh === '{' || nextCh === '*') {
-          i = scanExportClauseEnd(source, afterExport);
+          i = scanExportClauseEnd(source, afterExport, onImport, onExport);
           canStartRegex = true;
           prevNonWsChar = ';';
           continue;
@@ -380,6 +418,7 @@ export function stripModuleSyntax(source) {
             (source.startsWith('class', afterDefault) && !isIdentPart(source[afterDefault + 5])) ||
             (source.startsWith('async', afterDefault) && !isIdentPart(source[afterDefault + 5]));
           if (isDecl) {
+            recordExportedDeclarationIdent(source, afterDefault, onExport);
             i = afterDefault;
             canStartRegex = false;
             continue;
@@ -399,6 +438,7 @@ export function stripModuleSyntax(source) {
           (source.startsWith('class', afterExport) && !isIdentPart(source[afterExport + 5])) ||
           (source.startsWith('async', afterExport) && !isIdentPart(source[afterExport + 5]))
         ) {
+          recordExportedDeclarationIdent(source, afterExport, onExport);
           i = afterExport;
           canStartRegex = false;
           continue;
@@ -428,7 +468,32 @@ export function stripModuleSyntax(source) {
   return out;
 }
 
-export function buildBundle() {
+function validateBundleImport(sourcePath, specifier, clause, bundledPaths, moduleImportedNames) {
+  const binding = clause.replace(/\/\*[\s\S]*?\*\/|\/\/[^\r\n]*/g, ' ').trim();
+  if (binding) {
+    const named = /^\{([^}]*)\}\s*from$/.exec(binding);
+    const identifier = /^[$_\p{ID_Start}][$\u200c\u200d\p{ID_Continue}]*$/u;
+    if (!named) {
+      throw new Error(`${sourcePath}: only named imports without aliases are supported in app.js`);
+    }
+    for (const rawItem of named[1].split(',')) {
+      const name = rawItem.trim();
+      if (!name) continue;
+      if (!identifier.test(name)) {
+        throw new Error(`${sourcePath}: only named imports without aliases are supported in app.js`);
+      }
+      moduleImportedNames?.add(name);
+    }
+  }
+  if (
+    !(specifier.startsWith('./') || specifier.startsWith('../')) ||
+    !bundledPaths.has(resolve(dirname(sourcePath), specifier))
+  ) {
+    throw new Error(`${sourcePath}: ${specifier} must appear earlier in jsOrder`);
+  }
+}
+
+export function buildBundle(panelDir = PANEL_DIR) {
   const cssOrder = [
     'src/styles/tokens.css',
     'src/styles/base.css',
@@ -437,20 +502,30 @@ export function buildBundle() {
     'src/styles/views-overview.css',
     'src/styles/views-consumption.css',
     'src/styles/views-tables.css',
+    'src/styles/views-settings.css',
     'src/styles/overlay.css',
+    'src/styles/modern-ui.css',
   ];
 
   const cssBundle =
     cssOrder
-      .map((rel) => `/* --- ${rel} --- */\n${readFileSync(join(PANEL_DIR, rel), 'utf8').trim()}`)
+      .map(
+        (rel) =>
+          `/* --- ${rel} --- */\n${readFileSync(join(panelDir, rel), 'utf8').replace(/\r\n/g, '\n').trim()}`
+      )
       .join('\n\n') + '\n';
 
-  writeFileSync(join(PANEL_DIR, 'styles.css'), cssBundle, 'utf8');
-
   const jsOrder = [
+    'shared/settings-normalization.mjs',
+    'shared/telemetry-display-rules.mjs',
+    'shared/window-bridge-protocol.mjs',
     'src/icons/svgRegistry.js',
     'src/icons/SvgIcon.js',
     'src/core/reactive.js',
+    'src/i18n/zh-CN.js',
+    'src/i18n/en-US.js',
+    'src/i18n/index.js',
+    'src/core/appearance.js',
     'src/core/domPatch.js',
     'src/core/component.js',
     'src/core/formatters.js',
@@ -466,6 +541,24 @@ export function buildBundle() {
     'src/components/ui/ContextSegmentMeter.js',
     'src/components/ui/FourSegmentBar.js',
     'src/components/charts/TrendAreaChart.js',
+    'src/components/charts/SessionStepCharts.js',
+    'src/registries/metricRegistry.js',
+    'src/components/widgets/MetricMatrixWidget.js',
+    'src/components/widgets/ContextWindowWidget.js',
+    'src/components/widgets/QuotaPoolsWidget.js',
+    'src/components/widgets/LiveActivityWidget.js',
+    'src/registries/widgetRegistry.js',
+    'src/registries/stepColumnRegistry.js',
+    'src/components/widgets/CapsuleBarWidget.js',
+    'src/components/widgets/StepTableWidget.js',
+    'src/components/settings/structurePreviewMock.js',
+    'src/components/settings/CollapsibleSection.js',
+    'src/components/settings/EditableSlotList.js',
+    'src/components/settings/ThemeColorPicker.js',
+    'src/components/settings/BridgeStatusNotice.js',
+    'src/views/settings/SettingsGeneralTab.js',
+    'src/views/settings/SettingsStructureTab.js',
+    'src/views/settings/SettingsOtherTab.js',
     'src/components/layout/TopSessionHeader.js',
     'src/views/LiveOverviewView.js',
     'src/views/ConsumptionView.js',
@@ -476,24 +569,55 @@ export function buildBundle() {
     'src/main.js',
   ];
 
+  const bundledPaths = new Set();
+  const outerExportedSymbols = new Set();
   const innerModules = jsOrder
     .map((rel) => {
-      const raw = readFileSync(join(PANEL_DIR, rel), 'utf8');
-      const stripped = stripModuleSyntax(raw);
-      return `// --- ${rel} ---\n${stripped.trim()}`;
+      const path = resolve(panelDir, rel);
+      if (bundledPaths.has(path)) throw new Error(`${rel}: duplicate entry in jsOrder`);
+      const raw = readFileSync(path, 'utf8').replace(/\r\n/g, '\n');
+      const moduleImportedNames = new Set();
+      const moduleLocalExports = new Set();
+      const stripped = stripModuleSyntax(
+        raw,
+        (specifier, clause) =>
+          validateBundleImport(path, specifier, clause, bundledPaths, moduleImportedNames),
+        (name, isClauseExport) => {
+          if (isClauseExport && moduleImportedNames.has(name) && outerExportedSymbols.has(name)) {
+            return;
+          }
+          moduleLocalExports.add(name);
+        }
+      );
+      bundledPaths.add(path);
+      const exportList = [...moduleLocalExports];
+      for (const sym of exportList) {
+        outerExportedSymbols.add(sym);
+      }
+      const body = stripped.trim();
+      const wrapped =
+        exportList.length > 0
+          ? `const { ${exportList.join(', ')} } = (() => {\n${body}\nreturn { ${exportList.join(', ')} };\n})();`
+          : `(() => {\n${body}\n})();`;
+      return `// --- ${rel} ---\n${wrapped}`;
     })
     .join('\n\n');
 
   const jsBundle = `(() => {\n'use strict';\n\n${innerModules}\n})();\n`;
-
-  writeFileSync(join(PANEL_DIR, 'app.js'), jsBundle, 'utf8');
+  new Script(jsBundle, { filename: 'app.js' });
 
   const ver = Date.now();
-  const indexHtmlPath = join(PANEL_DIR, 'index.html');
-  if (existsSync(indexHtmlPath)) {
-    const html = readFileSync(indexHtmlPath, 'utf8')
+  const indexHtmlPath = join(panelDir, 'index.html');
+  const html = existsSync(indexHtmlPath)
+    ? readFileSync(indexHtmlPath, 'utf8')
+      .replace(/\r\n/g, '\n')
       .replace(/href="\/styles\.css(?:\?v=[^"]*)?"/, `href="/styles.css?v=${ver}"`)
-      .replace(/src="\/app\.js(?:\?v=[^"]*)?"/, `src="/app.js?v=${ver}"`);
+      .replace(/src="\/app\.js(?:\?v=[^"]*)?"/, `src="/app.js?v=${ver}"`)
+    : null;
+
+  writeFileSync(join(panelDir, 'styles.css'), cssBundle, 'utf8');
+  writeFileSync(join(panelDir, 'app.js'), jsBundle, 'utf8');
+  if (html !== null) {
     writeFileSync(indexHtmlPath, html, 'utf8');
   }
 

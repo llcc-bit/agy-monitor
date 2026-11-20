@@ -10,55 +10,486 @@
  * 3. 完全不触碰宿主 `app.asar` 文件，客户端升级或无调试端口时静默回退至右侧辅助栏。
  */
 
-import { existsSync, readFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import {
+  BRIDGE_API_PATHS,
+  CONTEXT_WINDOWS_GLOBAL_KEY,
+  WINDOW_BRIDGE_KEY,
+  WINDOW_BRIDGE_ROUTE_KEY,
+  WINDOW_OVERLAY_KEY,
+  WINDOW_OVERLAY_METHODS,
+} from '../shared/window-bridge-protocol.mjs';
 import {
   DATA_DIR,
   computeRuntimeCodeVersion,
   loadJson,
   loadSettings,
+  lsRuntimeEndpoint,
+  normalizeWindowMountMode,
   saveJson,
 } from './config.mjs';
+import {
+  createContextWindowSyncExpression,
+  getContextWindowModels,
+  resolveContextWindowRules,
+} from './context-windows.mjs';
+import {
+  ensureDesktopLaunchEntriesConfigured,
+  resolveDesktopHostExecutable,
+} from './desktop-launcher-config.mjs';
+import { callLsRpc, getContextModelCatalog } from './ls-rpc.mjs';
+
+const windowBridgeRef = `window[${JSON.stringify(WINDOW_BRIDGE_KEY)}]`;
+const windowOverlayRef = `window[${JSON.stringify(WINDOW_OVERLAY_KEY)}]`;
+const windowContextWindowsRef = `window[${JSON.stringify(CONTEXT_WINDOWS_GLOBAL_KEY)}]`;
+const windowBridgeRouteKey = JSON.stringify(WINDOW_BRIDGE_ROUTE_KEY);
+const overlayMethods = Object.fromEntries(
+  Object.entries(WINDOW_OVERLAY_METHODS).map(([method, key]) => [method, JSON.stringify(key)])
+);
 
 const BRIDGE_MAX_BODY_BYTES = 64 * 1024;
-const ALLOWED_BRIDGE_PATHS = new Set([
-  '/api/telemetry',
-  '/api/settings',
-  '/api/cloud-sync',
-  '/api/plugin-update',
-]);
+const ALLOWED_BRIDGE_PATHS = new Set(BRIDGE_API_PATHS);
 
 /**
- * 解析各操作系统下 Antigravity 写入 `DevToolsActivePort` 的候选路径列表。
+ * 解析各操作系统下 Antigravity 2.0 与 Antigravity IDE 写入 `DevToolsActivePort` 的候选路径列表。
+ * Linux 额外兼容全小写目录名、自定义 `XDG_CONFIG_HOME` 回退以及 Flatpak / Snap 一级容器配置目录。
  *
  * @param {Record<string, string|undefined>} [env=process.env]
  * @param {string} [platform=process.platform]
  * @param {string} [homeDir=homedir()]
+ * @param {{ readdirFn?: typeof readdirSync }|null} [fsOps=null]
  * @returns {string[]}
  */
 export function resolveDevToolsPortCandidates(
   env = process.env,
   platform = process.platform,
-  homeDir = homedir()
+  homeDir = homedir(),
+  fsOps = null
 ) {
   const explicitFile = String(env?.ANTIGRAVITY_DEVTOOLS_PORT_FILE || '').trim();
   if (explicitFile) {
     return [explicitFile];
   }
+  const out = [];
+  const seen = new Set();
+  const pushUnique = (p) => {
+    const clean = String(p || '').trim();
+    if (clean && !seen.has(clean)) {
+      seen.add(clean);
+      out.push(clean);
+    }
+  };
+  const portableRoot = String(env?.VSCODE_PORTABLE || '').trim();
+
   if (platform === 'win32') {
     const appData = env?.APPDATA || join(homeDir, 'AppData', 'Roaming');
     const localAppData = env?.LOCALAPPDATA || join(homeDir, 'AppData', 'Local');
-    return [
-      join(appData, 'Antigravity', 'DevToolsActivePort'),
-      join(localAppData, 'Antigravity', 'DevToolsActivePort'),
-    ];
+    pushUnique(join(appData, 'Antigravity', 'DevToolsActivePort'));
+    pushUnique(join(localAppData, 'Antigravity', 'DevToolsActivePort'));
+    pushUnique(join(appData, 'Antigravity IDE', 'DevToolsActivePort'));
+    pushUnique(join(localAppData, 'Antigravity IDE', 'DevToolsActivePort'));
+    if (portableRoot) {
+      pushUnique(join(portableRoot, 'user-data', 'DevToolsActivePort'));
+    }
+    return out;
   }
   if (platform === 'darwin') {
-    return [join(homeDir, 'Library', 'Application Support', 'Antigravity', 'DevToolsActivePort')];
+    pushUnique(join(homeDir, 'Library', 'Application Support', 'Antigravity', 'DevToolsActivePort'));
+    pushUnique(
+      join(homeDir, 'Library', 'Application Support', 'Antigravity IDE', 'DevToolsActivePort')
+    );
+    pushUnique(join(homeDir, 'Library', 'Application Support', 'antigravity', 'DevToolsActivePort'));
+    pushUnique(
+      join(homeDir, 'Library', 'Application Support', 'antigravity-ide', 'DevToolsActivePort')
+    );
+    pushUnique(join(homeDir, '.config', 'Antigravity', 'DevToolsActivePort'));
+    pushUnique(join(homeDir, '.config', 'Antigravity IDE', 'DevToolsActivePort'));
+    if (portableRoot) {
+      pushUnique(join(portableRoot, 'user-data', 'DevToolsActivePort'));
+    }
+    return out;
   }
-  const configHome = env?.XDG_CONFIG_HOME || join(homeDir, '.config');
-  return [join(configHome, 'Antigravity', 'DevToolsActivePort')];
+
+  const defaultConfigHome = join(homeDir, '.config');
+  const configHome = env?.XDG_CONFIG_HOME || defaultConfigHome;
+  pushUnique(join(configHome, 'Antigravity', 'DevToolsActivePort'));
+  pushUnique(join(configHome, 'Antigravity IDE', 'DevToolsActivePort'));
+  pushUnique(join(configHome, 'antigravity', 'DevToolsActivePort'));
+  pushUnique(join(configHome, 'antigravity-ide', 'DevToolsActivePort'));
+  if (configHome !== defaultConfigHome) {
+    pushUnique(join(defaultConfigHome, 'Antigravity', 'DevToolsActivePort'));
+    pushUnique(join(defaultConfigHome, 'Antigravity IDE', 'DevToolsActivePort'));
+    pushUnique(join(defaultConfigHome, 'antigravity', 'DevToolsActivePort'));
+    pushUnique(join(defaultConfigHome, 'antigravity-ide', 'DevToolsActivePort'));
+  }
+  if (portableRoot) {
+    pushUnique(join(portableRoot, 'user-data', 'DevToolsActivePort'));
+  }
+
+  const readdirFn = fsOps?.readdirFn || readdirSync;
+  const flatpakRoot = join(homeDir, '.var', 'app');
+  try {
+    for (const rawEntry of readdirFn(flatpakRoot) || []) {
+      const appId = typeof rawEntry === 'string' ? rawEntry : String(rawEntry?.name || '');
+      if (!appId || !/antigravity/i.test(appId)) continue;
+      pushUnique(join(flatpakRoot, appId, 'config', 'Antigravity', 'DevToolsActivePort'));
+      pushUnique(join(flatpakRoot, appId, 'config', 'antigravity', 'DevToolsActivePort'));
+      pushUnique(join(flatpakRoot, appId, 'config', 'Antigravity IDE', 'DevToolsActivePort'));
+    }
+  } catch {
+    // 宿主机未安装 Flatpak 或目录不可读时静默忽略
+  }
+
+  const snapRoot = join(homeDir, 'snap');
+  try {
+    for (const rawEntry of readdirFn(snapRoot) || []) {
+      const snapName = typeof rawEntry === 'string' ? rawEntry : String(rawEntry?.name || '');
+      if (!snapName || !/antigravity/i.test(snapName)) continue;
+      pushUnique(join(snapRoot, snapName, 'current', '.config', 'Antigravity', 'DevToolsActivePort'));
+      pushUnique(join(snapRoot, snapName, 'current', '.config', 'antigravity', 'DevToolsActivePort'));
+      pushUnique(
+        join(snapRoot, snapName, 'current', '.config', 'Antigravity IDE', 'DevToolsActivePort')
+      );
+    }
+  } catch {
+    // 宿主机未安装 Snap 或目录不可读时静默忽略
+  }
+
+  return out;
+}
+
+/**
+ * 解析 Antigravity IDE 启动参数文件 `argv.json` 路径（兼容便携模式 `VSCODE_PORTABLE`）。
+ *
+ * @param {Record<string, string|undefined>} [env=process.env]
+ * @param {string} [homeDir=homedir()]
+ * @returns {string}
+ */
+export function resolveIdeArgvPath(env = process.env, homeDir = homedir()) {
+  const portableRoot = String(env?.VSCODE_PORTABLE || '').trim();
+  if (portableRoot) {
+    return join(portableRoot, 'argv.json');
+  }
+  return join(homeDir, '.antigravity-ide', 'argv.json');
+}
+
+/**
+ * 词法扫描 JSONC 文本（支持 `//`、`/* ... * /` 注释与尾随逗号），提取纯 JSON 字符串及顶层键值坐标。
+ *
+ * @param {string} rawText
+ */
+function scanJsoncObject(rawText) {
+  const text = rawText.startsWith('\uFEFF') ? rawText.slice(1) : rawText;
+  const offsetDelta = rawText.length - text.length;
+  const tokens = [];
+  let i = 0;
+  const len = text.length;
+
+  while (i < len) {
+    const ch = text[i];
+    if (ch === ' ' || ch === '\t' || ch === '\r' || ch === '\n') {
+      i += 1;
+      continue;
+    }
+    if (ch === '/' && text[i + 1] === '/') {
+      i += 2;
+      while (i < len && text[i] !== '\n') i += 1;
+      continue;
+    }
+    if (ch === '/' && text[i + 1] === '*') {
+      const closeIdx = text.indexOf('*/', i + 2);
+      if (closeIdx < 0) return null;
+      i = closeIdx + 2;
+      continue;
+    }
+    if (ch === '"') {
+      const start = i;
+      i += 1;
+      while (i < len) {
+        if (text[i] === '\\') {
+          i += 2;
+          continue;
+        }
+        if (text[i] === '"') {
+          i += 1;
+          break;
+        }
+        i += 1;
+      }
+      const rawToken = text.slice(start, i);
+      let strVal = null;
+      try {
+        strVal = JSON.parse(rawToken);
+      } catch {
+        return null;
+      }
+      tokens.push({
+        type: 'string',
+        value: strVal,
+        raw: rawToken,
+        start: start + offsetDelta,
+        end: i + offsetDelta,
+      });
+      continue;
+    }
+    if ('{}[]:,'.includes(ch)) {
+      tokens.push({
+        type: 'punct',
+        raw: ch,
+        start: i + offsetDelta,
+        end: i + 1 + offsetDelta,
+      });
+      i += 1;
+      continue;
+    }
+    const start = i;
+    while (
+      i < len &&
+      !' \t\r\n{}[]:,"'.includes(text[i]) &&
+      !(text[i] === '/' && (text[i + 1] === '/' || text[i + 1] === '*'))
+    ) {
+      i += 1;
+    }
+    tokens.push({
+      type: 'primitive',
+      raw: text.slice(start, i),
+      start: start + offsetDelta,
+      end: i + offsetDelta,
+    });
+  }
+
+  if (tokens.length < 2 || tokens[0].raw !== '{' || tokens[tokens.length - 1].raw !== '}') {
+    return null;
+  }
+
+  const cleanParts = [];
+  for (let idx = 0; idx < tokens.length; idx += 1) {
+    const tok = tokens[idx];
+    const nextTok = tokens[idx + 1];
+    if (tok.raw === ',' && nextTok && (nextTok.raw === '}' || nextTok.raw === ']')) {
+      continue;
+    }
+    cleanParts.push(tok.raw);
+  }
+
+  let parsed = null;
+  try {
+    parsed = JSON.parse(cleanParts.join(''));
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return null;
+  }
+
+  const topProps = new Map();
+  let depth = 0;
+  for (let idx = 0; idx < tokens.length; idx += 1) {
+    const tok = tokens[idx];
+    if (tok.raw === '{' || tok.raw === '[') {
+      depth += 1;
+      continue;
+    }
+    if (tok.raw === '}' || tok.raw === ']') {
+      depth -= 1;
+      continue;
+    }
+    if (depth === 1 && tok.type === 'string' && tokens[idx + 1]?.raw === ':') {
+      const valFirst = tokens[idx + 2];
+      if (!valFirst) break;
+      let valLastIdx = idx + 2;
+      if (valFirst.raw === '{' || valFirst.raw === '[') {
+        let subDepth = 1;
+        valLastIdx += 1;
+        while (valLastIdx < tokens.length && subDepth > 0) {
+          if (tokens[valLastIdx].raw === '{' || tokens[valLastIdx].raw === '[') subDepth += 1;
+          else if (tokens[valLastIdx].raw === '}' || tokens[valLastIdx].raw === ']') subDepth -= 1;
+          if (subDepth > 0) valLastIdx += 1;
+        }
+      }
+      const valLast = tokens[valLastIdx] || valFirst;
+      topProps.set(tok.value, {
+        keyStart: tok.start,
+        valStart: valFirst.start,
+        valEnd: valLast.end,
+      });
+      idx = valLastIdx;
+    }
+  }
+
+  const closeTok = tokens[tokens.length - 1];
+  const prevTok = tokens[tokens.length - 2];
+  return {
+    parsed,
+    topProps,
+    closeBraceIdx: closeTok.start,
+    lastSigEndIdx: prevTok.end,
+    lastSigRaw: prevTok.raw,
+  };
+}
+
+/**
+ * 在保留全部 JSONC 注释、缩进与既有键的前提下，确保 `argv.json` 包含字符串类型的
+ * `"remote-debugging-port"`（Antigravity IDE 主进程仅接受非空字符串值，数值 `0` 会被忽略）。
+ *
+ * @param {string} rawText
+ * @returns {{ changed: boolean, valid: boolean, alreadyConfigured?: boolean, portValue?: string, reason?: string, text: string }}
+ */
+export function ensureRemoteDebuggingInArgvText(rawText) {
+  if (typeof rawText !== 'string' || !rawText.trim()) {
+    // 新建文件使用纯 JSON（无注释），同时兼容 VS Code/IDE JSONC 解析器与 Electron 严格 JSON.parse()
+    const fresh = '{\n\t"remote-debugging-port": "0"\n}\n';
+    return { changed: true, valid: true, portValue: '0', text: fresh };
+  }
+
+  const scanned = scanJsoncObject(rawText);
+  if (!scanned) {
+    return { changed: false, valid: false, reason: 'invalid_jsonc', text: rawText };
+  }
+
+  const existingVal = scanned.parsed['remote-debugging-port'];
+  if (typeof existingVal === 'string' && existingVal.trim().length > 0) {
+    return {
+      changed: false,
+      valid: true,
+      alreadyConfigured: true,
+      portValue: existingVal.trim(),
+      text: rawText,
+    };
+  }
+
+  const desiredPortStr =
+    typeof existingVal === 'number' &&
+    Number.isInteger(existingVal) &&
+    existingVal >= 0 &&
+    existingVal <= 65535
+      ? String(existingVal)
+      : '0';
+
+  const eol = rawText.includes('\r\n') ? '\r\n' : '\n';
+  const indentMatch = rawText.match(/^[ \t]+(?=")/m);
+  const indent = indentMatch ? indentMatch[0] : '\t';
+
+  let nextText = '';
+  const propSpan = scanned.topProps.get('remote-debugging-port');
+  if (propSpan) {
+    nextText =
+      rawText.slice(0, propSpan.valStart) +
+      JSON.stringify(desiredPortStr) +
+      rawText.slice(propSpan.valEnd);
+  } else {
+    let working = rawText;
+    let closeIdx = scanned.closeBraceIdx;
+    if (scanned.lastSigRaw !== '{' && scanned.lastSigRaw !== ',') {
+      working =
+        working.slice(0, scanned.lastSigEndIdx) + ',' + working.slice(scanned.lastSigEndIdx);
+      closeIdx += 1;
+    }
+    let insertPos = closeIdx;
+    while (insertPos > 0 && (working[insertPos - 1] === ' ' || working[insertPos - 1] === '\t')) {
+      insertPos -= 1;
+    }
+    const hasNewlineBeforeClose =
+      insertPos > 0 && (working[insertPos - 1] === '\n' || working[insertPos - 1] === '\r');
+    const insertion = hasNewlineBeforeClose
+      ? `${indent}"remote-debugging-port": ${JSON.stringify(desiredPortStr)}${eol}`
+      : `${eol}${indent}"remote-debugging-port": ${JSON.stringify(desiredPortStr)}${eol}`;
+    nextText = working.slice(0, insertPos) + insertion + working.slice(insertPos);
+  }
+
+  const verifyScan = scanJsoncObject(nextText);
+  if (!verifyScan || verifyScan.parsed['remote-debugging-port'] !== desiredPortStr) {
+    return { changed: false, valid: false, reason: 'post_check_failed', text: rawText };
+  }
+
+  return {
+    changed: true,
+    valid: true,
+    portValue: desiredPortStr,
+    text: nextText,
+  };
+}
+
+function patchSingleHostArgvFile(argvPath, { createDir = false, missingReason = 'dir_missing' } = {}) {
+  try {
+    const dirPath = dirname(argvPath);
+    if (!existsSync(dirPath)) {
+      if (!createDir) {
+        return { checked: true, updated: false, reason: missingReason, argvPath };
+      }
+      mkdirSync(dirPath, { recursive: true });
+    }
+    const rawText = existsSync(argvPath) ? readFileSync(argvPath, 'utf8') : '';
+    const patched = ensureRemoteDebuggingInArgvText(rawText);
+    if (!patched.valid) {
+      return { checked: true, updated: false, reason: patched.reason || 'invalid_jsonc', argvPath };
+    }
+    if (!patched.changed) {
+      return {
+        checked: true,
+        updated: false,
+        alreadyConfigured: true,
+        portValue: patched.portValue,
+        argvPath,
+      };
+    }
+    const tmpPath = `${argvPath}.tmp-${process.pid}`;
+    try {
+      writeFileSync(tmpPath, patched.text, 'utf8');
+      renameSync(tmpPath, argvPath);
+    } catch {
+      try {
+        unlinkSync(tmpPath);
+      } catch {
+        // 忽略临时文件清理异常
+      }
+      writeFileSync(argvPath, patched.text, 'utf8');
+    }
+    return {
+      checked: true,
+      updated: true,
+      portValue: patched.portValue,
+      argvPath,
+    };
+  } catch (err) {
+    return {
+      checked: true,
+      updated: false,
+      reason: err?.code || 'io_error',
+      argvPath,
+    };
+  }
+}
+
+/**
+ * 当本机存在 `~/.antigravity-ide` 配置目录且开启双栖模式时，自动补齐 `argv.json` 中的
+ * `"remote-debugging-port": "0"`，使 Antigravity IDE 下次启动时自动生成 `DevToolsActivePort`。
+ *
+ * @param {{ env?: Record<string, string|undefined>, homeDir?: string, enabled?: boolean }} [options]
+ */
+export function ensureIdeRemoteDebuggingArgv({
+  env = process.env,
+  homeDir = homedir(),
+  enabled = true,
+} = {}) {
+  if (!enabled) {
+    return { checked: false, updated: false, reason: 'disabled' };
+  }
+  const argvPath = resolveIdeArgvPath(env, homeDir);
+  return patchSingleHostArgvFile(argvPath, {
+    createDir: false,
+    missingReason: 'ide_dir_missing',
+  });
 }
 
 /**
@@ -75,9 +506,12 @@ export function parseDevToolsPortFile(rawText) {
   return Number.isInteger(port) && port > 0 && port <= 65535 ? port : null;
 }
 
+const IDE_WORKBENCH_URL_RE =
+  /^vscode-file:\/\/vscode-app\/.+\/workbench(?:\.esm|-jetski-agent)?\.html(?:[?#]|$)/i;
+
 /**
- * 判断 CDP `/json/list` 返回的目标是否为 Antigravity 主聊天窗口页面，
- * 严格排除 `vscode-webview://` 子视图、DevTools 面板与非本机回环地址。
+ * 判断 CDP `/json/list` 返回的目标是否为 Antigravity 2.0 或 Antigravity IDE 主窗口页面，
+ * 严格排除 `vscode-webview://` 子视图、`sharedProcess.html`、DevTools 面板与非本机回环地址。
  *
  * @param {object} target
  * @returns {boolean}
@@ -87,7 +521,9 @@ export function isAntigravityMainPageTarget(target) {
   if (target.type !== 'page') return false;
   const url = String(target.url || '').trim();
   const wsUrl = String(target.webSocketDebuggerUrl || '').trim();
-  if (!/^https:\/\/(127\.0\.0\.1|localhost|\[::1\]):\d+(?:\/|$)/i.test(url)) {
+  const isLoopbackAppPage = /^https:\/\/(127\.0\.0\.1|localhost|\[::1\]):\d+(?:\/|$)/i.test(url);
+  const isIdeWorkbenchPage = IDE_WORKBENCH_URL_RE.test(url);
+  if (!isLoopbackAppPage && !isIdeWorkbenchPage) {
     return false;
   }
   if (!/^ws:\/\/(127\.0\.0\.1|localhost|\[::1\]):\d+\//i.test(wsUrl)) {
@@ -97,14 +533,204 @@ export function isAntigravityMainPageTarget(target) {
 }
 
 /**
- * 校验桥接请求的 `Origin` 是否来自本机 Antigravity 主窗口 HTTPS 回环源。
+ * 从 Antigravity IDE 内嵌扩展聊天 iframe 地址（如 `http://127.0.0.1:41362/c/<uuid>?extensionView=true`）
+ * 中提取当前正在查看的会话 UUID。
+ *
+ * @param {unknown} rawUrl
+ * @returns {string}
+ */
+export function extractIdeExtensionCascadeId(rawUrl) {
+  const url = String(rawUrl || '').trim();
+  if (!url) return '';
+  if (!/^https?:\/\/(127\.0\.0\.1|localhost|\[::1\]):\d+\//i.test(url)) {
+    return '';
+  }
+  if (!/[?&]extension(?:View|Variant)=/i.test(url)) {
+    return '';
+  }
+  const m = url.match(
+    /\/c\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:[/?#]|$)/i
+  );
+  return m ? m[1] : '';
+}
+
+/**
+ * 判断 CDP 目标是否为 Antigravity IDE 内嵌扩展聊天视图（OOPIF `iframe`），
+ * 严格限定本机回环地址并校验 `extensionView`/`extensionVariant` 参数、`/c/<uuid>` 路由或已发现的 LS Hub 端口。
+ *
+ * @param {object} target
+ * @param {string} [lsAddr='']
+ * @returns {boolean}
+ */
+export function isIdeExtensionChatTarget(target, lsAddr = '') {
+  if (!target || typeof target !== 'object') return false;
+  if (isAntigravityMainPageTarget(target)) return false;
+  const type = String(target.type || '').trim().toLowerCase();
+  if (type !== 'iframe' && type !== 'webview' && type !== 'page') return false;
+  const url = String(target.url || '').trim();
+  if (!/^https?:\/\/(127\.0\.0\.1|localhost|\[::1\]):\d+(?:\/|$)/i.test(url)) {
+    return false;
+  }
+  if (/[?&]extension(?:View|Variant)=/i.test(url)) {
+    return true;
+  }
+  if (
+    /\/c\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?:[/?#]|$)/i.test(url)
+  ) {
+    return true;
+  }
+  const cleanLsAddr = String(lsAddr || '').trim().toLowerCase();
+  if (cleanLsAddr) {
+    try {
+      const parsed = new URL(url);
+      if (parsed.host.toLowerCase() === cleanLsAddr) {
+        return true;
+      }
+    } catch {
+      // 忽略非法 URL
+    }
+  }
+  return false;
+}
+
+/**
+ * 将同一调试端口下的扩展聊天子 iframe 会话路由与可注入聊天目标（按 `parentId` 树隔离，单窗口缺省时安全兜底）
+ * 关联到对应的 Antigravity IDE `workbench.html` 主窗口目标上。
+ *
+ * @param {Array<object>} rawTargets
+ * @param {Array<object>} mainTargets
+ * @param {{ lsAddr?: string, cdpPort?: number }} [options]
+ * @returns {Array<object>}
+ */
+export function associateIdeIframeRoutes(rawTargets, mainTargets, options = undefined) {
+  if (!Array.isArray(mainTargets) || mainTargets.length === 0) return [];
+  const lsAddr = String(options?.lsAddr || '').trim();
+  const cdpPort = Number(options?.cdpPort || 0);
+  const allList = Array.isArray(rawTargets) ? rawTargets : mainTargets;
+  const byId = new Map();
+  for (const t of allList) {
+    if (t && typeof t === 'object' && t.id) {
+      byId.set(String(t.id), t);
+    }
+  }
+
+  const ideTargets = mainTargets.filter((t) =>
+    IDE_WORKBENCH_URL_RE.test(String(t?.url || '').trim())
+  );
+  const mainIdeIds = new Set(ideTargets.map((t) => String(t?.id || '')).filter(Boolean));
+  const routeByMainId = new Map();
+  const unanchoredRoutes = [];
+  const chatTargetsByMainId = new Map();
+  const unanchoredChatTargets = [];
+
+  for (const t of allList) {
+    if (!t || typeof t !== 'object') continue;
+    if (t.type !== 'iframe' && isAntigravityMainPageTarget(t)) continue;
+
+    const isChatFrame = isIdeExtensionChatTarget(t, lsAddr);
+    const cascadeId = extractIdeExtensionCascadeId(t.url);
+    if (!cascadeId && !isChatFrame) continue;
+
+    let matchedMainId = '';
+    let curId = String(t.parentId || '').trim();
+    const visited = new Set();
+    while (curId && !visited.has(curId)) {
+      visited.add(curId);
+      if (mainIdeIds.has(curId)) {
+        matchedMainId = curId;
+        break;
+      }
+      const parentTarget = byId.get(curId);
+      curId = parentTarget ? String(parentTarget.parentId || '').trim() : '';
+    }
+
+    if (cascadeId) {
+      if (matchedMainId) {
+        if (!routeByMainId.has(matchedMainId)) {
+          routeByMainId.set(matchedMainId, cascadeId);
+        }
+      } else {
+        unanchoredRoutes.push(cascadeId);
+      }
+    }
+
+    if (isChatFrame) {
+      const rawUrl = String(t.url || '').trim();
+      const rawWs = String(t.webSocketDebuggerUrl || '').trim();
+      let wsUrl = '';
+      if (/^ws:\/\/(127\.0\.0\.1|localhost|\[::1\]):\d+\//i.test(rawWs)) {
+        wsUrl = rawWs;
+      } else if (cdpPort > 0 && t.id) {
+        wsUrl = `ws://127.0.0.1:${cdpPort}/devtools/page/${encodeURIComponent(String(t.id))}`;
+      }
+      let origin = '';
+      try {
+        origin = new URL(rawUrl).origin;
+      } catch {
+        // 忽略非法 URL
+      }
+      const fallbackUuidMatch = rawUrl.match(
+        /\/c\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:[/?#]|$)/i
+      );
+      const chatEntry = {
+        id: String(t.id || ''),
+        url: rawUrl,
+        origin,
+        cascadeId: cascadeId || (fallbackUuidMatch ? fallbackUuidMatch[1] : ''),
+        webSocketDebuggerUrl: wsUrl,
+        isIdeChatFrame: true,
+      };
+      if (matchedMainId) {
+        if (!chatTargetsByMainId.has(matchedMainId)) {
+          chatTargetsByMainId.set(matchedMainId, []);
+        }
+        chatTargetsByMainId.get(matchedMainId).push(chatEntry);
+      } else {
+        unanchoredChatTargets.push(chatEntry);
+      }
+    }
+  }
+
+  return mainTargets.map((t) => {
+    const isIde = IDE_WORKBENCH_URL_RE.test(String(t?.url || '').trim());
+    if (!isIde) {
+      return {
+        ...t,
+        isIdeWorkbench: false,
+        ideRouteCascadeId: '',
+        ideChatTargets: [],
+      };
+    }
+    const tid = String(t?.id || '');
+    let routeId = (tid && routeByMainId.get(tid)) || '';
+    if (!routeId && ideTargets.length === 1 && unanchoredRoutes.length > 0) {
+      routeId = unanchoredRoutes[0];
+    }
+    let chatTargets = tid && chatTargetsByMainId.has(tid) ? [...chatTargetsByMainId.get(tid)] : [];
+    if (chatTargets.length === 0 && ideTargets.length === 1 && unanchoredChatTargets.length > 0) {
+      chatTargets = [...unanchoredChatTargets];
+    }
+    return {
+      ...t,
+      isIdeWorkbench: true,
+      ideRouteCascadeId: routeId,
+      ideChatTargets: chatTargets,
+    };
+  });
+}
+
+/**
+ * 校验桥接请求的 `Origin` 是否来自本机 Antigravity 2.0 HTTPS 回环源或 Antigravity IDE `vscode-file` 源。
  *
  * @param {unknown} origin
  * @returns {boolean}
  */
 export function isAllowedBridgeOrigin(origin) {
   const text = String(origin || '').trim();
-  return /^https:\/\/(127\.0\.0\.1|localhost|\[::1\]):\d+$/i.test(text);
+  return (
+    /^https:\/\/(127\.0\.0\.1|localhost|\[::1\]):\d+$/i.test(text) ||
+    /^vscode-file:\/\/vscode-app$/i.test(text)
+  );
 }
 
 /**
@@ -159,6 +785,12 @@ export function createWindowBridgeController(options) {
     bootBundleVersion = '',
     onVersionDrift = null,
     leaseFilePath = '',
+    autoConfigureIdeArgv = options?.env === undefined && options?.homeDir === undefined,
+    launcherRecheckIntervalMs = 15 * 60 * 1000,
+    launcherExecFileFn = null,
+    launcherFsOps = null,
+    allowDesktopLauncherInTest = false,
+    existsHostFn = existsSync,
     WebSocketImpl = globalThis.WebSocket,
   } = options || {};
 
@@ -182,8 +814,44 @@ export function createWindowBridgeController(options) {
   let stopped = false;
   let syncInFlight = null;
   let hadInjectedTargets = false;
+  let hadInjectedChatFrames = false;
   let cdpFallbackActive = false;
+  let lastLauncherProvisionAtMs = 0;
+  let hostLauncherPromise = null;
+  let argvUpdatedThisBoot = false;
+  let argvConfigured = false;
+  let launcherConfigured = false;
+  let hasReadOnlyShortcuts = false;
+  const hostExecInfo = resolveDesktopHostExecutable({
+    env,
+    platform,
+    homeDir,
+    existsFn: existsHostFn,
+  });
+  // Windows / macOS / Linux 均支持从运行中宿主进程动态反查路径（含自定义盘符与 AppImage），自定义安装路径亦可一键重拉
+  const canRelaunch = Boolean(
+    hostExecInfo.found ||
+      ((platform === 'win32' || platform === 'darwin' || platform === 'linux') &&
+        options?.existsHostFn === undefined)
+  );
+  let lastPersistedLeaseSig = '';
+  let lastBridgeStatus = {
+    state: 'pending',
+    enabled: true,
+    aliveCount: 0,
+    targets: 0,
+    argvUpdatedThisBoot: false,
+    argvConfigured: false,
+    launcherConfigured: false,
+    hasReadOnlyShortcuts: false,
+    canRelaunch,
+    updatedAtMs: 0,
+  };
+  let hadContextWindows = false;
+  let contextWindowBootId = `${process.pid}:${Date.now()}`;
+  let cachedBackendCtxModels = { expiresAt: 0, models: [] };
   let nodeDepsPromise = null;
+  const allowedDynamicOrigins = new Set();
 
   async function loadNodeDeps() {
     if (!nodeDepsPromise) {
@@ -259,15 +927,20 @@ export function createWindowBridgeController(options) {
     }
     serverStartPromise = (async () => {
       const { http, crypto } = await loadNodeDeps();
+      const persistedLease = leaseFilePath ? loadJson(leaseFilePath, null) : null;
+      const persistedToken = String(persistedLease?.bridgeToken || '').trim();
+      const persistedPort = Number(persistedLease?.bridgePort || 0);
       if (!bridgeToken) {
-        bridgeToken = crypto.randomBytes(32).toString('hex');
+        bridgeToken = /^[0-9a-f]{64}$/i.test(persistedToken)
+          ? persistedToken
+          : crypto.randomBytes(32).toString('hex');
       }
 
       const srv = http.createServer((req, res) => {
         // 注意：主窗口为 https://127.0.0.1，桥接为 http://127.0.0.1，跨协议请求在 Chromium 中必然携带
         // Sec-Fetch-Site: cross-site；此处通过严格 Origin 白名单 + Host 校验 + 256-bit 随机令牌保障回环安全。
         const origin = String(req.headers.origin || '').trim();
-        if (!isAllowedBridgeOrigin(origin)) {
+        if (!isAllowedBridgeOrigin(origin) && !allowedDynamicOrigins.has(origin)) {
           res.writeHead(403, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: 'Forbidden origin' }));
           return;
@@ -385,17 +1058,47 @@ export function createWindowBridgeController(options) {
         });
       });
 
-      await new Promise((resolve, reject) => {
-        srv.once('error', reject);
-        srv.listen(0, '127.0.0.1', () => {
-          srv.removeListener('error', reject);
-          resolve();
+      const listenOnLoopback = (targetPort) =>
+        new Promise((resolve, reject) => {
+          const onErr = (err) => {
+            srv.removeListener('listening', onListening);
+            reject(err);
+          };
+          const onListening = () => {
+            srv.removeListener('error', onErr);
+            resolve();
+          };
+          srv.once('error', onErr);
+          srv.once('listening', onListening);
+          srv.listen(targetPort, '127.0.0.1');
         });
-      });
+
+      const preferredPort =
+        Number.isInteger(persistedPort) && persistedPort >= 1024 && persistedPort <= 65535
+          ? persistedPort
+          : 0;
+      if (preferredPort > 0) {
+        try {
+          await listenOnLoopback(preferredPort);
+        } catch {
+          await listenOnLoopback(0);
+        }
+      } else {
+        await listenOnLoopback(0);
+      }
       srv.unref?.();
       const addr = srv.address();
       bridgePort = typeof addr === 'object' && addr ? Number(addr.port || 0) : 0;
       server = srv;
+      if (leaseFilePath && bridgePort > 0) {
+        saveJson(leaseFilePath, {
+          pid: process.pid,
+          bundleVersion: String(getBundleVersionFn() || ''),
+          bridgePort,
+          bridgeToken,
+          updatedAtMs: Date.now(),
+        });
+      }
       return { port: bridgePort, token: bridgeToken };
     })().finally(() => {
       serverStartPromise = null;
@@ -404,18 +1107,34 @@ export function createWindowBridgeController(options) {
     return serverStartPromise;
   }
 
-  function findActiveDevToolsPort() {
+  function findActiveDevToolsPorts() {
     const candidates = resolveDevToolsPortCandidates(env, platform, homeDir);
+    const ports = [];
+    const seen = new Set();
     for (const filePath of candidates) {
       try {
         if (!existsSync(filePath)) continue;
         const port = parseDevToolsPortFile(readFileSync(filePath, 'utf8'));
-        if (port) return port;
+        if (port && !seen.has(port)) {
+          seen.add(port);
+          ports.push(port);
+        }
       } catch {
         // 忽略不可读候选文件
       }
     }
-    return null;
+    const rawExplicitPorts = String(env?.ANTIGRAVITY_DEVTOOLS_PORT || '').trim();
+    if (rawExplicitPorts) {
+      for (const token of rawExplicitPorts.split(/[\s,]+/)) {
+        if (!/^\d+$/.test(token)) continue;
+        const p = Number(token);
+        if (Number.isInteger(p) && p > 0 && p <= 65535 && !seen.has(p)) {
+          seen.add(p);
+          ports.push(p);
+        }
+      }
+    }
+    return ports;
   }
 
   async function listMainWindowTargets(cdpPort) {
@@ -439,7 +1158,57 @@ export function createWindowBridgeController(options) {
     });
     const parsed = JSON.parse(rawBody);
     if (!Array.isArray(parsed)) return [];
-    return parsed.filter(isAntigravityMainPageTarget);
+    const associated = associateIdeIframeRoutes(
+      parsed,
+      parsed.filter(isAntigravityMainPageTarget),
+      { lsAddr: lsRuntimeEndpoint.addr, cdpPort }
+    );
+    for (const mainT of associated) {
+      if (Array.isArray(mainT.ideChatTargets)) {
+        for (const ct of mainT.ideChatTargets) {
+          if (ct.origin && /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\]):\d+$/i.test(ct.origin)) {
+            allowedDynamicOrigins.add(ct.origin);
+          }
+        }
+      }
+    }
+    return associated;
+  }
+
+  function collectAllChatDebuggerUrls(mainTargets) {
+    const urls = [];
+    const seen = new Set();
+    for (const t of mainTargets) {
+      if (!Array.isArray(t?.ideChatTargets)) continue;
+      for (const ct of t.ideChatTargets) {
+        const wsUrl = String(ct?.webSocketDebuggerUrl || '').trim();
+        if (wsUrl && !seen.has(wsUrl)) {
+          seen.add(wsUrl);
+          urls.push(wsUrl);
+        }
+      }
+    }
+    return urls;
+  }
+
+  async function collectAllMainWindowTargets(cdpPorts) {
+    const settled = await Promise.allSettled(cdpPorts.map((p) => listMainWindowTargets(p)));
+    let reachableCount = 0;
+    const merged = [];
+    const seenWs = new Set();
+    for (const item of settled) {
+      if (item.status === 'fulfilled') {
+        reachableCount += 1;
+        for (const target of item.value) {
+          const wsKey = String(target.webSocketDebuggerUrl || '');
+          if (wsKey && !seenWs.has(wsKey)) {
+            seenWs.add(wsKey);
+            merged.push(target);
+          }
+        }
+      }
+    }
+    return { reachableCount, targets: merged };
   }
 
   async function evaluateOnTarget(wsUrl, expression) {
@@ -507,6 +1276,75 @@ export function createWindowBridgeController(options) {
     }
   }
 
+  function updateBridgeStatus(nextState, { enabled = true, aliveCount = 0, targets = 0, leasedBySelf = false, bundleVersion = '', prevLease = null } = {}) {
+    lastBridgeStatus = {
+      state: nextState,
+      enabled: Boolean(enabled),
+      aliveCount: Number(aliveCount || 0),
+      targets: Number(targets || 0),
+      argvUpdatedThisBoot: Boolean(argvUpdatedThisBoot),
+      argvConfigured: Boolean(argvConfigured || launcherConfigured),
+      launcherConfigured: Boolean(launcherConfigured || argvConfigured),
+      hasReadOnlyShortcuts: Boolean(hasReadOnlyShortcuts),
+      canRelaunch: Boolean(canRelaunch),
+      updatedAtMs: Date.now(),
+    };
+    if (leasedBySelf && leaseFilePath) {
+      const sig = `${nextState}:${lastBridgeStatus.aliveCount}:${lastBridgeStatus.targets}:${lastBridgeStatus.argvUpdatedThisBoot ? 1 : 0}:${lastBridgeStatus.launcherConfigured ? 1 : 0}:${lastBridgeStatus.hasReadOnlyShortcuts ? 1 : 0}:${lastBridgeStatus.canRelaunch ? 1 : 0}`;
+      if (sig !== lastPersistedLeaseSig) {
+        lastPersistedLeaseSig = sig;
+        saveJson(leaseFilePath, {
+          pid: process.pid,
+          bundleVersion,
+          bridgePort: bridgePort > 0 ? bridgePort : Number(prevLease?.bridgePort || 0) || undefined,
+          bridgeToken: bridgeToken || String(prevLease?.bridgeToken || '') || undefined,
+          syncState: lastBridgeStatus.state,
+          aliveCount: lastBridgeStatus.aliveCount,
+          targets: lastBridgeStatus.targets,
+          argvUpdatedThisBoot: lastBridgeStatus.argvUpdatedThisBoot,
+          argvConfigured: lastBridgeStatus.argvConfigured,
+          launcherConfigured: lastBridgeStatus.launcherConfigured,
+          hasReadOnlyShortcuts: lastBridgeStatus.hasReadOnlyShortcuts,
+          canRelaunch: lastBridgeStatus.canRelaunch,
+          updatedAtMs: Date.now(),
+        });
+      }
+    }
+  }
+
+  function provisionHostLaunchersOnce({ fastCheckIfActive = false } = {}) {
+    if (hostLauncherPromise) return hostLauncherPromise;
+    hostLauncherPromise = (async () => {
+      const ideRes = ensureIdeRemoteDebuggingArgv({ env, homeDir, enabled: true });
+      const desktopRes = await ensureDesktopLaunchEntriesConfigured({
+        enabled: true,
+        fastCheckIfActive,
+        env,
+        platform,
+        homeDir,
+        execFileFn: launcherExecFileFn,
+        fsOps: launcherFsOps,
+        allowInTest: allowDesktopLauncherInTest,
+      });
+      if (ideRes.updated || desktopRes.updated) {
+        argvUpdatedThisBoot = true;
+      }
+      if (ideRes.updated || ideRes.alreadyConfigured) {
+        argvConfigured = true;
+      }
+      launcherConfigured = Boolean(
+        desktopRes.updated || desktopRes.alreadyConfigured || desktopRes.configured
+      );
+      if (!desktopRes.fastPath) {
+        hasReadOnlyShortcuts = Boolean(desktopRes.hasReadOnlyShortcuts);
+      }
+      lastLauncherProvisionAtMs = Date.now();
+    })().finally(() => {
+      hostLauncherPromise = null;
+    });
+    return hostLauncherPromise;
+  }
+
   async function runSyncInternal({ forceReinject = false } = {}) {
     if (stopped) return { ok: false, reason: 'stopped' };
     const bundleVersion = String(getBundleVersionFn() || '');
@@ -515,9 +1353,20 @@ export function createWindowBridgeController(options) {
       return { ok: false, reason: 'version_drift_restarting', injected: 0 };
     }
 
-    const enabled = Boolean(getSettingsFn()?.enableWindowOverlay !== false);
-    if (enabled && leaseFilePath && !forceReinject) {
+    const curSettings = getSettingsFn() || {};
+    const mountMode = normalizeWindowMountMode(
+      curSettings.windowMountMode,
+      curSettings.enableWindowOverlay
+    );
+    const enabled = Boolean(curSettings.enableWindowOverlay !== false && mountMode !== 'sidebar');
+    const contextWindows = curSettings.modelContextWindows || {};
+    const hasContextWindows = Object.keys(contextWindows).length > 0;
+
+    let leasedBySelf = false;
+    let currentLease = null;
+    if ((enabled || hasContextWindows) && leaseFilePath && !forceReinject) {
       const lease = loadJson(leaseFilePath, null);
+      currentLease = lease;
       const leasePid = Number(lease?.pid || 0);
       const leaseAgeMs = Date.now() - Number(lease?.updatedAtMs || 0);
       if (leasePid > 0 && leasePid !== process.pid && leaseAgeMs >= 0 && leaseAgeMs < 9000 && isPidAlive(leasePid)) {
@@ -528,78 +1377,237 @@ export function createWindowBridgeController(options) {
           return { ok: false, enabled: true, reason: 'older_than_leader', injected: 0 };
         }
         if (leaseVerNum === myVerNum || String(lease?.bundleVersion || '') === bundleVersion) {
+          const mergedConfigured = Boolean(
+            lease?.launcherConfigured || lease?.argvConfigured || launcherConfigured || argvConfigured
+          );
+          lastBridgeStatus = {
+            state: String(lease?.syncState || 'active'),
+            enabled: Boolean(enabled),
+            aliveCount: Number(lease?.aliveCount || 0),
+            targets: Number(lease?.targets || 0),
+            argvUpdatedThisBoot: Boolean(lease?.argvUpdatedThisBoot || argvUpdatedThisBoot),
+            argvConfigured: mergedConfigured,
+            launcherConfigured: mergedConfigured,
+            hasReadOnlyShortcuts: Boolean(lease?.hasReadOnlyShortcuts || hasReadOnlyShortcuts),
+            canRelaunch: Boolean(lease?.canRelaunch ?? canRelaunch),
+            updatedAtMs: Date.now(),
+          };
           return { ok: true, enabled: true, reason: 'follower_yield', leaderPid: leasePid, injected: 0 };
         }
       }
+      leasedBySelf = true;
+      lastPersistedLeaseSig = '';
       saveJson(leaseFilePath, {
         pid: process.pid,
         bundleVersion,
+        bridgePort: bridgePort > 0 ? bridgePort : Number(lease?.bridgePort || 0) || undefined,
+        bridgeToken: bridgeToken || String(lease?.bridgeToken || '') || undefined,
+        syncState: lastBridgeStatus.state,
+        aliveCount: lastBridgeStatus.aliveCount,
+        targets: lastBridgeStatus.targets,
+        argvUpdatedThisBoot: Boolean(argvUpdatedThisBoot),
+        argvConfigured: Boolean(argvConfigured || launcherConfigured),
+        launcherConfigured: Boolean(launcherConfigured || argvConfigured),
+        hasReadOnlyShortcuts: Boolean(hasReadOnlyShortcuts),
+        canRelaunch: Boolean(canRelaunch),
         updatedAtMs: Date.now(),
       });
     }
 
-    const cdpPort = findActiveDevToolsPort();
-    if (!cdpPort) {
+    const shouldCheckLaunchers =
+      (enabled || hasContextWindows) &&
+      autoConfigureIdeArgv &&
+      (lastLauncherProvisionAtMs === 0 ||
+        Date.now() - lastLauncherProvisionAtMs >= launcherRecheckIntervalMs);
+    const isInitialLauncherPass = lastLauncherProvisionAtMs === 0;
+
+    const cdpPorts = findActiveDevToolsPorts();
+    if (!cdpPorts.length) {
+      const provPending = shouldCheckLaunchers
+        ? provisionHostLaunchersOnce({ fastCheckIfActive: !isInitialLauncherPass })
+        : hostLauncherPromise;
+      if (provPending) {
+        await provPending.catch(() => {});
+      }
+      updateBridgeStatus(enabled || hasContextWindows ? 'no_devtools_port' : 'disabled', {
+        enabled,
+        leasedBySelf,
+        bundleVersion,
+        prevLease: currentLease,
+      });
       return { ok: false, enabled, reason: 'no_devtools_port', injected: 0 };
     }
 
-    let targets = [];
-    try {
-      targets = await listMainWindowTargets(cdpPort);
-    } catch {
+    const { reachableCount, targets } = await collectAllMainWindowTargets(cdpPorts);
+    if (reachableCount === 0) {
+      const provPending = shouldCheckLaunchers
+        ? provisionHostLaunchersOnce({ fastCheckIfActive: !isInitialLauncherPass })
+        : hostLauncherPromise;
+      if (provPending) {
+        await provPending.catch(() => {});
+      }
+      updateBridgeStatus(enabled || hasContextWindows ? 'cdp_unreachable' : 'disabled', {
+        enabled,
+        leasedBySelf,
+        bundleVersion,
+        prevLease: currentLease,
+      });
       return { ok: false, enabled, reason: 'cdp_unreachable', injected: 0 };
     }
+
+    if (shouldCheckLaunchers) {
+      // 调试端口已正常连通时走纯 Node.js 零子进程快检（<2ms），仅在发现未配参快捷方式时才拉起 PowerShell
+      void provisionHostLaunchersOnce({ fastCheckIfActive: true }).catch(() => {});
+    }
     if (!targets.length) {
+      updateBridgeStatus(enabled ? 'no_targets' : 'disabled', {
+        enabled,
+        leasedBySelf,
+        bundleVersion,
+        prevLease: currentLease,
+      });
       return { ok: true, enabled, reason: 'no_targets', injected: 0 };
     }
 
+    if (hasContextWindows || hadContextWindows) {
+      let fallbackRules = {};
+      if (
+        hasContextWindows &&
+        lsRuntimeEndpoint.baseUrl &&
+        lsRuntimeEndpoint.addr !== 'test.invalid'
+      ) {
+        if (Date.now() >= cachedBackendCtxModels.expiresAt) {
+          try {
+            const [stRes, cat] = await Promise.all([
+              callLsRpc('GetUserStatus', {}, 1500),
+              getContextModelCatalog(),
+            ]);
+            const cfgs = stRes?.userStatus?.cascadeModelConfigData?.clientModelConfigs;
+            if (Array.isArray(cfgs)) {
+              cachedBackendCtxModels = {
+                expiresAt: Date.now() + 10_000,
+                models: getContextWindowModels(cfgs, cat),
+              };
+            }
+          } catch {
+            // 忽略瞬态 LS 查询失败，保留上次缓存或交由窗口端解析
+          }
+        }
+        if (cachedBackendCtxModels.models.length > 0) {
+          fallbackRules = resolveContextWindowRules(cachedBackendCtxModels.models, contextWindows);
+        }
+      }
+      const chatUrls = [
+        ...targets.filter((target) => !target.isIdeWorkbench).map((target) => target.webSocketDebuggerUrl),
+        ...collectAllChatDebuggerUrls(targets),
+      ];
+      const expression = createContextWindowSyncExpression(
+        contextWindows,
+        contextWindowBootId,
+        fallbackRules
+      );
+      await Promise.allSettled([...new Set(chatUrls)].map((url) => evaluateOnTarget(url, expression)));
+      hadContextWindows = hasContextWindows;
+    }
+
+    const disposeExpr = `(() => {
+      try {
+        const existed = Boolean(${windowOverlayRef} || ${windowBridgeRef});
+        ${windowOverlayRef}?.[${overlayMethods.dispose}]?.();
+        delete ${windowOverlayRef};
+        delete ${windowBridgeRef};
+        return existed;
+      } catch {
+        return false;
+      }
+    })()`;
+
+    async function disposeSingleTarget(wsUrl) {
+      if (!wsUrl) return false;
+      try {
+        const res = await evaluateOnTarget(wsUrl, disposeExpr);
+        return res?.result?.result?.value === true;
+      } catch {
+        return false;
+      }
+    }
+
     if (!enabled) {
-      if (!hadInjectedTargets && !forceReinject) {
+      if (!hadInjectedTargets && !hadInjectedChatFrames && !forceReinject) {
+        updateBridgeStatus('disabled', {
+          enabled: false,
+          targets: targets.length,
+          leasedBySelf,
+          bundleVersion,
+          prevLease: currentLease,
+        });
         return { ok: true, enabled: false, removed: 0 };
       }
-      const disposeExpr = `(() => {
-        try {
-          const existed = Boolean(window.__AGUsageMonitorOverlay || window.__AGUsageMonitorBridge);
-          window.__AGUsageMonitorOverlay?.dispose?.();
-          delete window.__AGUsageMonitorOverlay;
-          delete window.__AGUsageMonitorBridge;
-          return existed;
-        } catch {
-          return false;
-        }
-      })()`;
       let removed = 0;
-      for (const target of targets) {
-        try {
-          const res = await evaluateOnTarget(target.webSocketDebuggerUrl, disposeExpr);
-          if (res?.result?.result?.value === true) removed += 1;
-        } catch {
-          // 单窗口不可达不阻塞其余窗口卸载
-        }
+      const allDisposeUrls = [
+        ...targets.map((t) => String(t.webSocketDebuggerUrl || '')).filter(Boolean),
+        ...collectAllChatDebuggerUrls(targets),
+      ];
+      for (const wsUrl of new Set(allDisposeUrls)) {
+        if (await disposeSingleTarget(wsUrl)) removed += 1;
       }
       hadInjectedTargets = false;
+      hadInjectedChatFrames = false;
+      updateBridgeStatus('disabled', {
+        enabled: false,
+        targets: targets.length,
+        leasedBySelf,
+        bundleVersion,
+        prevLease: currentLease,
+      });
       return { ok: true, enabled: false, removed };
     }
 
     const { port, token } = await ensureBridgeServer();
     const probeExpr = `(() => {
       try {
-        const ov = window.__AGUsageMonitorOverlay;
-        const br = window.__AGUsageMonitorBridge;
-        const alive = Boolean(ov && typeof ov.ensureAlive === 'function' && ov.ensureAlive());
+        const ov = ${windowOverlayRef};
+        const br = ${windowBridgeRef};
+        const alive = Boolean(ov && typeof ov[${overlayMethods.ensureAlive}] === 'function' && ov[${overlayMethods.ensureAlive}]());
+        const dockKind = String(ov?.[${overlayMethods.getDockKind}]?.() || '');
+        const clientMountMode = String(ov?.[${overlayMethods.getMountMode}]?.() || '');
+        const visible = Boolean(
+          (window.innerWidth === undefined || Number(window.innerWidth) > 80) &&
+          (window.innerHeight === undefined || Number(window.innerHeight) > 80) &&
+          !(typeof document !== 'undefined' && document?.hidden === true)
+        );
         const rpcBatch = Array.isArray(br?.rpcQueue) && br.rpcQueue.length > 0
           ? br.rpcQueue.splice(0, 8)
           : [];
+        let routeCascadeId = '';
+        if (!alive) {
+          const uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+          const m = String(window.location?.pathname || '').match(/^\\/c\\/([0-9a-f-]{36})(?:\\/|$)/i);
+          if (m && uuidRe.test(m[1])) {
+            routeCascadeId = m[1];
+          } else if (typeof document !== 'undefined' && typeof document.querySelector === 'function') {
+            const el =
+              document.querySelector('[data-testid="conversation-view"][data-cascade-id]') ||
+              document.querySelector('[data-testid^="conversation-row-"][data-selected="true"][data-cascade-id]');
+            const cand = String(el?.getAttribute?.('data-cascade-id') || '').trim();
+            if (uuidRe.test(cand)) routeCascadeId = cand;
+          }
+        }
         return {
           alive,
+          dockKind,
+          clientMountMode,
+          visible,
           bundleVersion: String(ov?.bundleVersion || ''),
           bridgePort: Number(br?.port || 0),
           hasToken: Boolean(br?.token),
           transportMode: String(br?.transportMode || 'http'),
+          hostRouteCascadeId: String(br?.[${windowBridgeRouteKey}] || ''),
+          routeCascadeId,
           rpcBatch,
         };
       } catch {
-        return { alive: false, bundleVersion: '', bridgePort: 0, hasToken: false, transportMode: 'http', rpcBatch: [] };
+        return { alive: false, dockKind: '', visible: true, bundleVersion: '', bridgePort: 0, hasToken: false, transportMode: 'http', hostRouteCascadeId: '', routeCascadeId: '', rpcBatch: [] };
       }
     })()`;
 
@@ -609,90 +1617,203 @@ export function createWindowBridgeController(options) {
     let relayedRpcCount = 0;
     let sawCdpTransport = false;
 
-    for (const target of targets) {
-      try {
-        if (!forceReinject) {
-          const probeRes = await evaluateOnTarget(target.webSocketDebuggerUrl, probeExpr);
-          const snap = probeRes?.result?.result?.value;
-          if (snap && snap.alive === true) {
-            const snapVerNum = Number(snap.bundleVersion) || 0;
-            const curVerNum = Number(bundleVersion) || 0;
-            if (snapVerNum > 0 && curVerNum > 0 && snapVerNum > curVerNum) {
-              onVersionDrift?.();
-              aliveCount += 1;
-              continue;
+    async function syncSingleTarget(targetObj, { ideRouteOverride = '', isIdeChatFrame = false } = {}) {
+      const wsUrl = String(targetObj?.webSocketDebuggerUrl || '').trim();
+      if (!wsUrl) return { alive: false, dockKind: '', visible: false };
+      let probedRouteId = '';
+      const ideRouteId = String(ideRouteOverride || targetObj.ideRouteCascadeId || '').trim();
+      if (!forceReinject) {
+        const probeRes = await evaluateOnTarget(wsUrl, probeExpr);
+        const snap = probeRes?.result?.result?.value;
+        probedRouteId = String(snap?.routeCascadeId || '').trim();
+        if (snap && snap.alive === true) {
+          const snapVerNum = Number(snap.bundleVersion) || 0;
+          const curVerNum = Number(bundleVersion) || 0;
+          if (snapVerNum > 0 && curVerNum > 0 && snapVerNum > curVerNum) {
+            onVersionDrift?.();
+            aliveCount += 1;
+            return {
+              alive: true,
+              dockKind: String(snap.dockKind || ''),
+              visible: snap.visible !== false,
+            };
+          }
+          if (snap.bundleVersion === bundleVersion) {
+            if (snap.bridgePort !== port || snap.hasToken !== true) {
+              const rebindExpr = `${windowOverlayRef}?.[${overlayMethods.updateBridge}]?.(${JSON.stringify({ port, token })})`;
+              await evaluateOnTarget(wsUrl, rebindExpr);
             }
-            if (snap.bundleVersion === bundleVersion) {
-              if (snap.bridgePort !== port || snap.hasToken !== true) {
-                const rebindExpr = `window.__AGUsageMonitorOverlay?.updateBridge?.(${JSON.stringify({ port, token })})`;
-                await evaluateOnTarget(target.webSocketDebuggerUrl, rebindExpr);
+            let effectiveDockKind = String(snap.dockKind || '');
+            if (snap.clientMountMode && snap.clientMountMode !== mountMode) {
+              const modeSyncExpr = `(() => {
+                const overlay = ${windowOverlayRef};
+                overlay?.[${overlayMethods.applyMountMode}]?.(${JSON.stringify(mountMode)});
+                return String(overlay?.[${overlayMethods.getDockKind}]?.() || '');
+              })()`;
+              const modeRes = await evaluateOnTarget(wsUrl, modeSyncExpr);
+              if (typeof modeRes?.result?.result?.value === 'string') {
+                effectiveDockKind = modeRes.result.result.value;
               }
-              aliveCount += 1;
+            }
+            if (
+              (targetObj.isIdeWorkbench || isIdeChatFrame) &&
+              ideRouteId &&
+              String(snap.hostRouteCascadeId || '') !== ideRouteId
+            ) {
+              const routeSyncExpr = `(() => {
+                const bridge = ${windowBridgeRef};
+                if (bridge) bridge[${windowBridgeRouteKey}] = ${JSON.stringify(ideRouteId)};
+                ${windowOverlayRef}?.[${overlayMethods.syncHostRoute}]?.();
+              })()`;
+              await evaluateOnTarget(wsUrl, routeSyncExpr);
+            }
+            aliveCount += 1;
+            if (isIdeChatFrame) {
+              hadInjectedChatFrames = true;
+            } else {
               hadInjectedTargets = true;
-              if (snap.transportMode === 'cdp') {
-                sawCdpTransport = true;
-              }
-              if (Array.isArray(snap.rpcBatch) && snap.rpcBatch.length > 0) {
-                sawCdpTransport = true;
-                const rpcResults = await executeRpcBatch(snap.rpcBatch);
-                relayedRpcCount += rpcResults.length;
-                const deliverExpr = `window.__AGUsageMonitorOverlay?.deliverRpc?.(${JSON.stringify(rpcResults)})`;
-                await evaluateOnTarget(target.webSocketDebuggerUrl, deliverExpr);
-              }
-              continue;
             }
+            if (snap.transportMode === 'cdp') {
+              sawCdpTransport = true;
+            }
+            if (Array.isArray(snap.rpcBatch) && snap.rpcBatch.length > 0) {
+              sawCdpTransport = true;
+              const rpcResults = await executeRpcBatch(snap.rpcBatch);
+              relayedRpcCount += rpcResults.length;
+              const deliverExpr = `${windowOverlayRef}?.[${overlayMethods.deliverRpc}]?.(${JSON.stringify(rpcResults)})`;
+              await evaluateOnTarget(wsUrl, deliverExpr);
+            }
+            return {
+              alive: true,
+              dockKind: effectiveDockKind,
+              visible: snap.visible !== false,
+            };
           }
         }
+      }
 
-        if (!cachedAssets) {
-          const [stylesCss, appJs] = await Promise.all([
-            readAssetFn('styles.css'),
-            readAssetFn('app.js'),
-          ]);
-          cachedAssets = { stylesCss, appJs };
-        }
+      if (!cachedAssets) {
+        const [stylesCss, appJs] = await Promise.all([
+          readAssetFn('styles.css'),
+          readAssetFn('app.js'),
+        ]);
+        cachedAssets = { stylesCss, appJs };
+      }
 
-        let initialTelemetry = null;
-        try {
-          const routeMatch = String(target.url || '').match(/\/c\/([a-f0-9-]{36})(?:\/|$)/i);
-          const targetConvId = routeMatch ? routeMatch[1] : '';
-          const initOut = await handleApiRequest('/api/telemetry', 'GET', {
-            conversationId: targetConvId,
-            range: 'today',
-          });
-          if (Number(initOut?.status || 200) === 200 && initOut?.body) {
-            initialTelemetry = JSON.parse(initOut.body);
-          }
-        } catch {
-          // 预取首帧遥测异常不阻塞注入本身
-        }
-
-        const bridgeConfigJson = JSON.stringify({
-          port,
-          token,
-          bundleVersion,
-          stylesCss: cachedAssets.stylesCss,
-          initialTelemetry,
+      let initialTelemetry = null;
+      try {
+        const routeMatch = String(targetObj.url || '').match(/\/c\/([a-f0-9-]{36})(?:[/?#]|$)/i);
+        const targetConvId = routeMatch ? routeMatch[1] : ideRouteId || probedRouteId;
+        const initOut = await handleApiRequest('/api/telemetry', 'GET', {
+          conversationId: targetConvId,
+          range: 'today',
+          stepDetails: 'display',
+          stepRevision: '',
         });
-        const injectionScript = `(() => {\nwindow.__AGUsageMonitorBridge = ${bridgeConfigJson};\n})();\n${cachedAssets.appJs}\nBoolean(window.__AGUsageMonitorOverlay && window.__AGUsageMonitorOverlay.ensureAlive && window.__AGUsageMonitorOverlay.ensureAlive());`;
+        if (Number(initOut?.status || 200) === 200 && initOut?.body) {
+          initialTelemetry = JSON.parse(initOut.body);
+        }
+      } catch {
+        // 预取首帧遥测异常不阻塞注入本身
+      }
 
-        const evalRes = await evaluateOnTarget(target.webSocketDebuggerUrl, injectionScript);
-        if (
-          evalRes &&
-          !evalRes.error &&
-          !evalRes.result?.exceptionDetails &&
-          evalRes.result?.result?.value === true
-        ) {
-          injected += 1;
-          aliveCount += 1;
+      const bridgeConfigJson = JSON.stringify({
+        port,
+        token,
+        bundleVersion,
+        platform: String(platform || ''),
+        mountMode,
+        [WINDOW_BRIDGE_ROUTE_KEY]: ideRouteId || '',
+        isIdeChatFrame: Boolean(isIdeChatFrame),
+        stylesCss: cachedAssets.stylesCss,
+        initialTelemetry,
+      });
+      const injectionScript = `(() => {
+        ${windowBridgeRef} = ${bridgeConfigJson};
+      })();
+      ${cachedAssets.appJs}
+      (() => {
+        const ov = ${windowOverlayRef};
+        const alive = Boolean(ov?.[${overlayMethods.ensureAlive}]?.());
+        const visible = Boolean(
+          (window.innerWidth === undefined || Number(window.innerWidth) > 80) &&
+          (window.innerHeight === undefined || Number(window.innerHeight) > 80) &&
+          !(typeof document !== 'undefined' && document?.hidden === true)
+        );
+        return { alive, dockKind: String(ov?.[${overlayMethods.getDockKind}]?.() || ''), visible };
+      })();`;
+
+      const evalRes = await evaluateOnTarget(wsUrl, injectionScript);
+      const evalVal = evalRes?.result?.result?.value;
+      const isInjectedAlive =
+        Boolean(evalRes && !evalRes.error && !evalRes.result?.exceptionDetails) &&
+        (evalVal === true || evalVal?.alive === true);
+      if (isInjectedAlive) {
+        injected += 1;
+        aliveCount += 1;
+        if (isIdeChatFrame) {
+          hadInjectedChatFrames = true;
+        } else {
           hadInjectedTargets = true;
         }
+        return {
+          alive: true,
+          dockKind: typeof evalVal === 'object' && evalVal ? String(evalVal.dockKind || '') : '',
+          visible: typeof evalVal === 'object' && evalVal ? evalVal.visible !== false : true,
+        };
+      }
+      return { alive: false, dockKind: '', visible: false };
+    }
+
+    if (mountMode !== 'composer' && (hadInjectedChatFrames || forceReinject)) {
+      for (const chatWsUrl of collectAllChatDebuggerUrls(targets)) {
+        await disposeSingleTarget(chatWsUrl);
+      }
+      hadInjectedChatFrames = false;
+    }
+
+    for (const target of targets) {
+      try {
+        if (mountMode === 'composer' && target.isIdeWorkbench) {
+          const chatList = Array.isArray(target.ideChatTargets) ? target.ideChatTargets : [];
+          let chatComposerActive = false;
+          for (const chatTarget of chatList) {
+            if (!chatTarget.webSocketDebuggerUrl) continue;
+            try {
+              const chatState = await syncSingleTarget(chatTarget, {
+                ideRouteOverride: chatTarget.cascadeId || target.ideRouteCascadeId,
+                isIdeChatFrame: true,
+              });
+              if (chatState.alive && chatState.visible && chatState.dockKind === 'composer') {
+                chatComposerActive = true;
+              }
+            } catch {
+              // 单个聊天子视图异常不阻断主窗口兜底
+            }
+          }
+          if (chatComposerActive) {
+            await disposeSingleTarget(target.webSocketDebuggerUrl);
+          } else {
+            await syncSingleTarget(target);
+          }
+          continue;
+        }
+
+        await syncSingleTarget(target);
       } catch {
         // 单个窗口注入异常不阻断其他窗口
       }
     }
 
     cdpFallbackActive = sawCdpTransport;
+    updateBridgeStatus(aliveCount > 0 ? 'active' : 'no_targets', {
+      enabled: true,
+      aliveCount,
+      targets: targets.length,
+      leasedBySelf,
+      bundleVersion,
+      prevLease: currentLease,
+    });
     return {
       ok: true,
       enabled: true,
@@ -731,8 +1852,20 @@ export function createWindowBridgeController(options) {
 
   function start() {
     stopped = false;
+    contextWindowBootId = `${process.pid}:${Date.now()}`;
     if (initialTimer) clearTimeout(initialTimer);
     if (pollTimer) clearTimeout(pollTimer);
+
+    if (leaseFilePath) {
+      const curSettings = getSettingsFn() || {};
+      const mountMode = normalizeWindowMountMode(
+        curSettings.windowMountMode,
+        curSettings.enableWindowOverlay
+      );
+      if (curSettings.enableWindowOverlay !== false && mountMode !== 'sidebar') {
+        ensureBridgeServer().catch(() => {});
+      }
+    }
 
     initialTimer = setTimeout(() => {
       initialTimer = null;
@@ -741,7 +1874,7 @@ export function createWindowBridgeController(options) {
         .finally(() => {
           scheduleNextPoll();
         });
-    }, 350);
+    }, 120);
     initialTimer.unref?.();
   }
 
@@ -754,16 +1887,32 @@ export function createWindowBridgeController(options) {
       clearTimeout(pollTimer);
       pollTimer = null;
     }
-    if (disposeWindows && hadInjectedTargets) {
+    if (disposeWindows && (hadInjectedTargets || hadInjectedChatFrames || hadContextWindows)) {
       const prevStopped = stopped;
       stopped = false;
       try {
-        const cdpPort = findActiveDevToolsPort();
-        if (cdpPort) {
-          const targets = await listMainWindowTargets(cdpPort).catch(() => []);
-          const disposeExpr = `(() => { try { window.__AGUsageMonitorOverlay?.dispose?.(); delete window.__AGUsageMonitorOverlay; delete window.__AGUsageMonitorBridge; return true; } catch { return false; } })()`;
-          for (const t of targets) {
-            await evaluateOnTarget(t.webSocketDebuggerUrl, disposeExpr).catch(() => {});
+        const cdpPorts = findActiveDevToolsPorts();
+        if (cdpPorts.length) {
+          const { targets } = await collectAllMainWindowTargets(cdpPorts).catch(() => ({
+            targets: [],
+          }));
+          const disposeExpr = `(() => {
+            try {
+              ${windowContextWindowsRef}?.dispose?.();
+              ${windowOverlayRef}?.[${overlayMethods.dispose}]?.();
+              delete ${windowOverlayRef};
+              delete ${windowBridgeRef};
+              return true;
+            } catch {
+              return false;
+            }
+          })()`;
+          const allUrls = [
+            ...targets.map((t) => String(t.webSocketDebuggerUrl || '')).filter(Boolean),
+            ...collectAllChatDebuggerUrls(targets),
+          ];
+          for (const wsUrl of new Set(allUrls)) {
+            await evaluateOnTarget(wsUrl, disposeExpr).catch(() => {});
           }
         }
       } finally {
@@ -772,6 +1921,8 @@ export function createWindowBridgeController(options) {
     }
     stopped = true;
     hadInjectedTargets = false;
+    hadInjectedChatFrames = false;
+    hadContextWindows = false;
     if (server) {
       const srv = server;
       server = null;
@@ -783,6 +1934,50 @@ export function createWindowBridgeController(options) {
   function notifySettingChanged(enabled) {
     if (!enabled) {
       hadInjectedTargets = true;
+      hadInjectedChatFrames = true;
+      const cur = getSettingsFn() || {};
+      const hasCtx = Object.keys(cur.modelContextWindows || {}).length > 0;
+      if (!hasCtx && autoConfigureIdeArgv) {
+        launcherConfigured = false;
+        hasReadOnlyShortcuts = false;
+        lastLauncherProvisionAtMs = 0;
+        void ensureDesktopLaunchEntriesConfigured({
+          enabled: false,
+          env,
+          platform,
+          homeDir,
+          execFileFn: launcherExecFileFn,
+          fsOps: launcherFsOps,
+          allowInTest: allowDesktopLauncherInTest,
+        }).catch(() => {});
+      }
+    } else {
+      lastLauncherProvisionAtMs = 0;
+      hadInjectedChatFrames = true;
+    }
+    return syncAllWindows({ forceReinject: false }).catch(() => ({ ok: false }));
+  }
+
+  function notifyContextWindowsChanged() {
+    const cur = getSettingsFn() || {};
+    const mountMode = normalizeWindowMountMode(cur.windowMountMode, cur.enableWindowOverlay);
+    const overlayOn = Boolean(cur.enableWindowOverlay !== false && mountMode !== 'sidebar');
+    const hasCtx = Object.keys(cur.modelContextWindows || {}).length > 0;
+    if (hasCtx) {
+      lastLauncherProvisionAtMs = 0;
+    } else if (!overlayOn && autoConfigureIdeArgv) {
+      launcherConfigured = false;
+      hasReadOnlyShortcuts = false;
+      lastLauncherProvisionAtMs = 0;
+      void ensureDesktopLaunchEntriesConfigured({
+        enabled: false,
+        env,
+        platform,
+        homeDir,
+        execFileFn: launcherExecFileFn,
+        fsOps: launcherFsOps,
+        allowInTest: allowDesktopLauncherInTest,
+      }).catch(() => {});
     }
     return syncAllWindows({ forceReinject: false }).catch(() => ({ ok: false }));
   }
@@ -791,13 +1986,36 @@ export function createWindowBridgeController(options) {
     ensureBridgeServer,
     syncAllWindows,
     notifySettingChanged,
+    notifyContextWindowsChanged,
     start,
     stop,
     getBridgeInfo: () => ({ port: bridgePort, token: bridgeToken, running: Boolean(server) }),
+    getBridgeStatus: () => ({ ...lastBridgeStatus }),
   };
 }
 
 let defaultBridgeController = null;
+
+/**
+ * 读取进程级默认双栖桥接器的最新同步健康度快照（供 `/api/telemetry` 与偏好设置面板诊断使用）。
+ */
+export function getDefaultWindowBridgeStatus() {
+  if (!defaultBridgeController) {
+    return {
+      state: 'pending',
+      enabled: true,
+      aliveCount: 0,
+      targets: 0,
+      argvUpdatedThisBoot: false,
+      argvConfigured: false,
+      launcherConfigured: false,
+      hasReadOnlyShortcuts: false,
+      canRelaunch: false,
+      updatedAtMs: 0,
+    };
+  }
+  return defaultBridgeController.getBridgeStatus();
+}
 
 /**
  * 启动进程级默认的双栖窗口桥接控制器（幂等）。
@@ -823,4 +2041,9 @@ export function startDefaultWindowBridge(options) {
 export function notifyWindowOverlaySetting(enabled) {
   if (!defaultBridgeController) return Promise.resolve({ ok: false });
   return defaultBridgeController.notifySettingChanged(enabled);
+}
+
+export function notifyModelContextWindowsChanged() {
+  if (!defaultBridgeController) return Promise.resolve({ ok: false });
+  return defaultBridgeController.notifyContextWindowsChanged();
 }

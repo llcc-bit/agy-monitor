@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "host": {
+      "command": "node",
+      "args": [
+        "${PLUGIN_ROOT}/sidecars/panel/mcp-entry.mjs"
+      ],
+      "env": {
+        "USAGE_MONITOR_PLUGIN_DATA": "${PLUGIN_DATA}"
+      }
+    }
+  }
+}

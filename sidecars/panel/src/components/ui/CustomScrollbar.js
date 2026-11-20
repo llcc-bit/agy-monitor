@@ -34,6 +34,7 @@ export const CustomScrollbar = defineComponent({
     let isDragging = false;
     let dragStartY = 0;
     let dragStartScrollTop = 0;
+    let scrollRafId = 0;
 
     function syncThumb() {
       const scrollHeight = Number(contentEl.scrollHeight || 0);
@@ -60,7 +61,15 @@ export const CustomScrollbar = defineComponent({
     }
 
     function onContentScroll() {
-      syncThumb();
+      if (isDragging || typeof requestAnimationFrame !== 'function') {
+        syncThumb();
+        return;
+      }
+      if (scrollRafId) return;
+      scrollRafId = requestAnimationFrame(() => {
+        scrollRafId = 0;
+        syncThumb();
+      });
     }
 
     function onDocMouseMove(e) {
@@ -115,7 +124,7 @@ export const CustomScrollbar = defineComponent({
       syncThumb();
     });
 
-    contentEl.addEventListener('scroll', onContentScroll);
+    contentEl.addEventListener('scroll', onContentScroll, { passive: true });
     hostEl.addEventListener('mouseenter', syncThumb);
 
     let resizeObserver = null;
@@ -129,6 +138,10 @@ export const CustomScrollbar = defineComponent({
 
     onCleanup(() => {
       onDocMouseUp();
+      if (scrollRafId && typeof cancelAnimationFrame === 'function') {
+        cancelAnimationFrame(scrollRafId);
+        scrollRafId = 0;
+      }
       contentEl.removeEventListener('scroll', onContentScroll);
       hostEl.removeEventListener('mouseenter', syncThumb);
       if (resizeObserver) {

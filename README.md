@@ -1,105 +1,173 @@
+<div align="center">
+
+<img src="assets/logo.svg" alt="AGY Monitor Logo" width="76" />
+
 # agy-monitor
 
-**专为 Google Antigravity IDE 打造的侧边栏与双栖实时用量 / 吐字速率监控插件。**
+**A full-surface usage, quota, and real-time decode speed monitor for Google Antigravity 2.0 Desktop, Antigravity IDE, and Antigravity CLI (`agy`) with zero external npm dependencies.**
 
-> 本项目基于 [`yuhuan-dev/antigravity-usage-monitor`](https://github.com/yuhuan-dev/antigravity-usage-monitor)（`v1.4.5`）二次开发，遵循 **GPL-3.0-only** 开源协议。  
-> **界面语言说明**：当前插件 UI 界面（侧边栏面板、顶栏胶囊、设置项等）**仅支持简体中文**。
+> Forked and enhanced from [`yuhuan-dev/antigravity-usage-monitor`](https://github.com/yuhuan-dev/antigravity-usage-monitor) (`v1.5.2`) under **GPL-3.0-only**.  
+> **UI Languages**: Built-in **简体中文**, **English**, and **System (Auto)** switching under **Settings -> Appearance**.
 
----
+English | [简体中文](README.zh-CN.md)
 
-## 界面预览
+[Preview](#ui-preview) · [What's New in This Fork](#whats-new-in-this-fork) · [Prerequisites & Setup](#prerequisites--configuration) · [Installation](#installation) · [Client Support](#client-support-matrix) · [Development](#local-development--testing)
 
-![界面预览](./preview.png)
-
-> 如需替换预览截图，只需将你的截图重命名为 `preview.png` 并放置于仓库根目录即可。
+</div>
 
 ---
 
-## 核心功能亮点
+## UI Preview
 
-### 本仓库新增与强化能力
-- **输入框下方极简实时吐字速率浮标**：在主聊天输入框正下方右侧轻量展示当前速率（如 `156 tok/s`），无点击拦截，不遮挡操作。
-  - **流式生成中**：亮起绿色呼吸点，基于 `3.5s` 滑动窗口实时估算当前吐字速度（带 EMA 平滑与缓冲毛刺收敛）；
-  - **生成完成后**：自动切换为扣除原生首字延迟（TTFT）后的**纯解码吐字速率（Decode TPS）**，同时跳过 `< 1.0s` 短缓冲工具调用导致的 1000+ tok/s 假峰值，且不破坏原面板的端到端测速统计口径。
+![AGY Monitor Preview](./preview.png)
 
-### 完整监控能力
-- **实时速度与延迟监控**：精准追踪端到端输出速度（TPS）、首字延迟（TTFT）、会话有效平均速度与单步 / 累计折算费用。
-- **十维上下文窗口占用拆解**：实时分析模型回复、工具结果、用户消息、子代理通知、压缩摘要、系统提示词、系统工具、MCP 工具、Skill 与用户规则的占比变化。
-- **多池模型可用额度追踪**：同步展示 `Gemini`、`Gemini 4 Argon`、`Gemini 4 Carbon` 与 `Claude & GPT` 模型池的 5 小时限额、每周限额及重置倒计时。
-- **14 天用量趋势与费用统计**：支持按今日、1 天、7 天、14 天、30 天、全部或自定义区间统计总 Token、缓存命中率、缓存节省金额、用量趋势曲线及分模型排行。
-- **主代理与子代理独立追踪**：支持全部汇总或按主/子代理分别查看调用明细与上下文窗口。
-- **双栖无侵入挂载**：同时支持右上角顶栏胶囊悬浮面板与右侧辅助栏展开，全程不修改宿主 `app.asar`。
+<table>
+  <tr>
+    <td align="center" width="33.3%">
+      <img src="assets/preview-details.png" alt="Call Details and Step Breakdown" />
+      <br />
+      <b>Call Details</b>
+      <br />
+      <sub>Per-step TPS, TTFT, Context / Thinking / Reply split, anomaly diagnostics &amp; cost</sub>
+    </td>
+    <td align="center" width="33.3%">
+      <img src="assets/preview-settings.png" alt="Language, Theme and Update Settings" />
+      <br />
+      <b>Preferences &amp; Appearance</b>
+      <br />
+      <sub>简体中文 / English / System UI, 6 theme accents, font scaling &amp; safe update policy</sub>
+    </td>
+    <td align="center" width="33.3%">
+      <img src="assets/preview-model-format.png" alt="Model Name Display Options" />
+      <br />
+      <b>Model ID Formatting</b>
+      <br />
+      <sub>Compact slug, full upstream ID, or vendor-stripped ID switching</sub>
+    </td>
+  </tr>
+</table>
 
 ---
 
-## 前置依赖说明
+## What's New in This Fork
 
-- **完全独立运行，不需要提前安装或运行原版 Token Monitor。**
-- **无需打包 `.vsix`，零第三方 `npm` 依赖，无需执行 `npm install`。**
-- 插件通过 Google Antigravity 宿主自动注入的本地 Language Server Connect RPC（`ANTIGRAVITY_LS_ADDRESS` / `ANTIGRAVITY_CSRF_TOKEN`）及本地 `~/.gemini/antigravity/` 会话轨迹文件获取数据，仅依赖 Google Antigravity IDE 自带的 Node.js 运行时。
-- 本仓库已内置编译好的前端静态资源（`sidecars/panel/app.js` 与 `sidecars/panel/styles.css`），拉取后即可直接启用；默认关闭自动与弹窗更新提醒（可在 **偏好设置 -> 版本更新** 中随时开启）。
+- **Minimalist Live Decode Speed Badge Below the Composer Input**:
+  - Mounts cleanly right below the bottom-right corner of the main chat input box (`pointer-events: none`, zero click interception, automatic light/dark adaptation).
+  - **While streaming**: Pulses a green live dot and estimates real-time output speed via a `3.5s` sliding window (`<= 900ms` active polling) with EMA smoothing and flush-burst dampening.
+  - **After completion**: Automatically switches to **TTFT-excluded pure Decode TPS** (`output / (totalDuration - nativeTtft)`), filtering out `< 1.0s` buffered tool-call steps that cause `1000+ tok/s` false spikes—without altering the main panel's end-to-end request throughput stats.
+- **Fixes `Orchestrator (Neon)` (`orchestrator-carbon`) Mislabeling Bug**:
+  - Fixed upstream placeholder/regex gaps (`MODEL_PLACEHOLDER_M537` / `gemini-pro-orchestrator-neon` and `MODEL_PLACEHOLDER_M532` / `Gemini 4 Neon`) where Pro users invoking Neon orchestrator calls were misclassified and rendered as `orchestrator-carbon` in both backend attribution and frontend labels.
+- **Fork-Safe Update Defaults**:
+  - Targets `llcc-bit/agy-monitor` and sets `pluginUpdateMode` to **`off`** by default so upstream releases will never accidentally overwrite your local customizations. You can still manually trigger **Check Updates** or **Update Pricing Catalog** anytime in **Settings**.
+
+### Inherited Core Capabilities (`v1.5.2`)
+- **Multi-Surface Non-Invasive Mounting**: Works as a titlebar/composer capsule + auxiliary sidebar in **Antigravity 2.0 Desktop**, a titlebar/composer capsule in **Antigravity IDE**, a 24-bit ANSI single-line `statusLine` in **Antigravity CLI (`agy`)**, and a **Standalone Web UI**—without modifying `app.asar`.
+- **10-Category Context Window Breakdown**: Inspects model replies, tool results, user messages, subagent notices, checkpoints, system prompt, system tools, MCP tools, skills, and user rules, plus per-model custom context limit overrides.
+- **Multi-Pool Quotas & 154+ Model Pricing Catalog**: Tracks 5-hour and weekly quotas across `Gemini`, `Gemini 4 Argon`, `Gemini 4 Carbon`, and `Claude & GPT`, with phased promotional pricing support.
+- **Historical Analytics & Multi-Agent / Swarm Tracking**: Supports `Today`, `1d`, `7d`, `14d`, `30d`, `All`, and custom date ranges, hourly/daily trend curves, client source breakdown (`Desktop App` / `IDE` / `CLI`), and inline subagent/swarm inspection.
+- **Offline SQLite + Transcript Reading**: Reads CLI SQLite + WAL databases, `annotations/*.pbtxt`, `transcript.jsonl`, and `.deep_stats_cache.json`.
 
 ---
 
-## 保姆级安装与使用步骤
+## Prerequisites & Configuration
 
-> 这是一个 **Google Antigravity 原生插件**（由根目录 `plugin.json` 与 `sidecars/panel/sidecar.json` 驱动），**不是 VS Code `.vsix` 扩展**，直接放到 Antigravity 插件目录即可生效。
+> [!IMPORTANT]
+> Read these prerequisites before installing so topbar capsules, the composer speed badge, and CLI status lines work immediately on first launch.
 
-### 第 1 步：下载插件到 Antigravity 插件目录
+### 1. Base Runtime Requirements
+- **Completely Standalone**: You do **NOT** need to install or run the original Token Monitor or Usage Monitor.
+- **Zero External `npm` Packages**: No `npm install` or build step is required before running—compiled `sidecars/panel/app.js` and `sidecars/panel/styles.css` are committed in the repository.
+- **Node.js Runtime**:
+  - Desktop & IDE sidecars run on Google Antigravity's built-in Node.js runtime.
+  - For **Antigravity CLI (`agy`)** offline SQLite+WAL reading or **Standalone Web** mode, **Node.js 22.5+** (with built-in `node:sqlite`) is recommended.
+- **Avoid Conflicts with Upstream `usage-monitor`**:
+  - If you previously installed `yuhuan-dev/antigravity-usage-monitor` (`usage-monitor`), **disable** it in **Customizations -> Installed** before enabling **AGY Monitor** (`agy-monitor`) to prevent duplicate capsules. Both plugins safely share historical data under `~/.gemini/antigravity/sidecar_data/usage-monitor/panel/data/` (or `~/.gemini/antigravity-cli/...`), so disabling the old plugin preserves all your history.
 
-#### 方式 A：使用 Git 克隆（推荐）
+### 2. Surface-Specific Host Configuration
 
-**Windows（PowerShell）：**
+| Surface | Required Prerequisite | How It Is Configured |
+| --- | --- | --- |
+| **Antigravity 2.0 Desktop (`2.33.0+`)** | Host must run with `--remote-debugging-port=0` so local CDP (`DevToolsActivePort`) is active for the titlebar capsule and bottom `tok/s` badge. | **Automatic**: The plugin patches Windows personal shortcuts (`.lnk`), `HKCU\...\Run`, `antigravity://` handler, or Linux `.desktop` files automatically. If your current session started without the flag (or uses a read-only All-Users shortcut), click **Relaunch Host** in the plugin notice banner / Settings. *(Sidebar-only mode works even without CDP.)* |
+| **Antigravity IDE** | `"remote-debugging-port": "0"` in `~/.antigravity-ide/argv.json`. | **Automatic on first enable**: The zero-tool MCP keepalive helper adds `"remote-debugging-port": "0"` while preserving comments and existing settings. **Restart Antigravity IDE once** after enabling. |
+| **Antigravity CLI (`agy`)** | `statusLine` command registered in `~/.gemini/antigravity-cli/settings.json` + Node.js 22.5+. | Toggle in **Settings** inside the panel, or run: `node ~/.gemini/config/plugins/agy-monitor/sidecars/panel/cli-statusline.mjs --install` |
+| **Cloud Catalog / Update Sync *(Optional)*** | HTTPS access to `github.com` / `raw.githubusercontent.com`. | Core monitoring is 100% local and works offline. In proxy/restricted environments, ensure your system proxy or `HTTP_PROXY` / `HTTPS_PROXY` is set if you use **Update Pricing Catalog** or **Check Updates**. |
+
+### 3. Optional Environment Variables
+- `ANTIGRAVITY_GEMINI_DIR`: Override default `~/.gemini` root directory.
+- `USAGE_MONITOR_DATA_DIR`: Override cache and settings storage directory.
+- `AGY_CLI_AUTO_COMPACT_OVERRIDE`: Override CLI auto-compaction context window thresholds.
+
+---
+
+## Client Support Matrix
+
+| Client / Environment | Capsule / Status Bar | Full Panel | Input-Box Live Speed Badge | Offline SQLite & Logs | Modifies `app.asar` |
+| --- | :---: | :---: | :---: | :---: | :---: |
+| **Google Antigravity 2.0 Desktop** | Titlebar / Composer | Hover Popover + Auxiliary Sidebar | Supported | Supported | No |
+| **Google Antigravity IDE** | Titlebar / Composer | Click Capsule Popover | Supported *(when composer card is present)* | Supported | No |
+| **Google Antigravity CLI (`agy`)** | Terminal `statusLine` | Standalone Web (`--port`) | — | Supported (`node:sqlite` + `.pbtxt`) | No |
+| **Headless Server / SSH** | Terminal `statusLine` | SSH Tunnel / `--token` Web | — | Supported | No |
+
+---
+
+## Installation
+
+> This is a **Google Antigravity native plugin** driven by `plugin.json` and `sidecars/panel/sidecar.json` (**not** a VS Code `.vsix` extension).
+
+### Option A: Git Clone (Recommended)
+
+**Windows (PowerShell):**
 ```powershell
 $pluginsDir = "$env:USERPROFILE\.gemini\config\plugins"
 New-Item -ItemType Directory -Path $pluginsDir -Force | Out-Null
 git clone https://github.com/llcc-bit/agy-monitor.git "$pluginsDir\agy-monitor"
 ```
 
-**macOS / Linux：**
+**macOS / Linux:**
 ```bash
 mkdir -p ~/.gemini/config/plugins
 git clone https://github.com/llcc-bit/agy-monitor.git ~/.gemini/config/plugins/agy-monitor
 ```
 
-#### 方式 B：直接下载 ZIP 压缩包（未装 Git 时可用）
+### Option B: Download ZIP
 
-1. 在本仓库页面点击 **Code -> Download ZIP**（或前往 Releases 下载压缩包）。
-2. 将压缩包解压后重命名文件夹为 `agy-monitor`，确保文件夹内直接包含 `plugin.json`。
-3. 把整个 `agy-monitor` 文件夹放到：
-   - **Windows**：`C:\Users\<你的用户名>\.gemini\config\plugins\agy-monitor`
-   - **macOS / Linux**：`~/.gemini/config/plugins/agy-monitor`
+1. Click **Code -> Download ZIP** (or download from **Releases**).
+2. Extract and ensure the folder is named **`agy-monitor`** with `plugin.json` directly inside it.
+3. Place the folder at:
+   - **Windows**: `C:\Users\<YourUsername>\.gemini\config\plugins\agy-monitor`
+   - **macOS / Linux**: `~/.gemini/config/plugins/agy-monitor`
 
-### 第 2 步：在 Antigravity 中启用
+### Enable & Launch
 
-1. 打开 Google Antigravity IDE，进入左侧边栏 **Customizations** -> **Installed**。
-2. 找到 **`AGY Monitor`**（`agy-monitor`），打开启用开关；若已在运行且更新了代码，关闭后重新开启一次即可热重载。
-3. **打开面板方式**：
-   - **顶部栏双栖悬浮模式（默认开启）**：右上角顶部栏会自动出现实时状态胶囊，悬停查看速览，左键点击展开完整监控面板，主聊天输入框右下角会同步展示实时速率。
-   - **右侧辅助栏**：点击窗口右上角 `⋮` -> **Extensions** -> **用量监控**。
-   - **快捷唤起**：直接在对话中输入「打开用量监控面板」。
+1. Open Google Antigravity Desktop or IDE and go to **Customizations -> Installed**.
+2. Disable **`Usage & Speed Monitor`** if previously installed, then enable **`AGY Monitor`** (`agy-monitor`).
+3. You can also launch the standalone web dashboard anytime:
+   ```bash
+   node ~/.gemini/config/plugins/agy-monitor/sidecars/panel/standalone.mjs
+   ```
 
 ---
 
-## 本地开发与测试
+## Local Development & Testing
 
-如果你修改了 `sidecars/panel/src/` 下的前端代码，需要在 `sidecars/panel` 目录重新编译静态资源后再重载插件：
+If you edit frontend sources under `sidecars/panel/src/`, rebuild the classic bundles and run the full zero-dependency unit test suite:
 
 ```powershell
 cd sidecars/panel
 
-# 重新打包前端 app.js 与 styles.css
+# Rebuild app.js and styles.css
 node scripts/build-bundle.mjs
 
-# 运行全部单元测试（零额外依赖）
+# Run all 171 unit tests
 node --test test/*.test.mjs
-```
 
-> 提示：在开启严格执行策略的 Windows PowerShell 环境中若 `npm test` 受限，直接使用上述 `node` 命令即可正常运行。
+# Optional: build a lean runtime-only ZIP into dist/agy-monitor.zip
+node scripts/pack-release-zip.mjs
+```
 
 ---
 
-## 开源协议与致谢
+## License & Credits
 
-- 本项目基于 [`yuhuan-dev/antigravity-usage-monitor`](https://github.com/yuhuan-dev/antigravity-usage-monitor) 二次开发，特此向原作者 `yuhuan-dev` 致谢。
-- 依据上游许可证要求，本项目继续完整遵循 **GNU General Public License v3.0 only (`GPL-3.0-only`)** 开源，详见 [LICENSE](./LICENSE)。
+- Based on [`yuhuan-dev/antigravity-usage-monitor`](https://github.com/yuhuan-dev/antigravity-usage-monitor) by `yuhuan-dev`.
+- Licensed under **GNU General Public License v3.0 only (`GPL-3.0-only`)**. See [LICENSE](./LICENSE) for full terms and modification history.

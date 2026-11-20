@@ -1,13 +1,17 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import fs from 'node:fs';
-import vm from 'node:vm';
-import { extractModelSteps, normalizeCachedStep, MODEL_IDENTITY_VERSION } from '../speed-metrics.mjs';
-import { formatUsd, resolveModelDisplayInfo } from '../src/core/formatters.js';
+import { isEquivalentTelemetry } from '../src/store/telemetryStore.js';
+import { extractModelSteps, normalizeCachedStep, MODEL_IDENTITY_VERSION } from '../trajectory-metrics.mjs';
+import {
+  formatUsd,
+  mergeModelsByDisplayName,
+  resolveModelDisplayInfo,
+} from '../src/core/formatters.js';
 import { backendHarness } from './backend-harness.mjs';
 
 const FLASH = 'MODEL_PLACEHOLDER_M318', ARGON = 'MODEL_PLACEHOLDER_M418';
-const createdAtMs = Date.now() - 20_000;
+const PROMO_CLOCK_MS = Date.parse('2026-11-17T12:00:20Z');
+const createdAtMs = PROMO_CLOCK_MS - 20_000;
 function step(index, model, checkpoint = false) {
   return { type: checkpoint ? 'CORTEX_STEP_TYPE_CHECKPOINT' : 'CORTEX_STEP_TYPE_PLANNER_RESPONSE',
     status: 'CORTEX_STEP_STATUS_DONE', metadata: {
@@ -18,7 +22,7 @@ function step(index, model, checkpoint = false) {
     } };
 }
 async function payload(steps, options = {}) {
-  return backendHarness({ summaries: { test: { stepCount: steps.length } },
+  return backendHarness({ clock: () => PROMO_CLOCK_MS, summaries: { test: { stepCount: steps.length } },
     trajectories: { test: { trajectory: { steps } } }, ...options }).buildTelemetryPayloadInternal('test');
 }
 
@@ -131,7 +135,7 @@ test('upstream responseModel is preserved alongside placeholder modelKey for Ste
 });
 
 test('server model catalog overrides static placeholder mapping', () => {
-  const {resolveModelInfo} = backendHarness();
+  const {resolveModelInfo} = backendHarness({ clock: () => PROMO_CLOCK_MS });
   const result = resolveModelInfo(ARGON, new Map([[ARGON, {modelId:'gemini-3.8-flash-high', label:'Gemini 3.8 Flash (High)'}]]));
   assert.equal(result.shortName,'flash-3.8-high'); assert.equal(result.pricing.input,0.75);
 });
@@ -188,12 +192,9 @@ test('custom cost budget cannot claim a complete remaining percentage when price
 });
 
 test('frontend considers a model-only correction a real telemetry update', () => {
-  const source = fs.readFileSync(new URL('../src/store/telemetryStore.js',import.meta.url),'utf8');
-  const fn = source.slice(source.indexOf('function isEquivalentTelemetry'),source.indexOf('export async function fetchTelemetry'));
-  const ctx = {}; vm.runInNewContext(fn+'\nglobalThis.compare=isEquivalentTelemetry;',ctx);
   const a={activeConversation:{recentSteps:[{modelKey:'unknown',modelShort:'模型未知',costUsd:null}]}};
   const b=structuredClone(a); b.activeConversation.recentSteps[0].modelShort='new-model';
-  assert.equal(ctx.compare(a,b),false); assert.equal(ctx.compare(a,structuredClone(a)),true);
+  assert.equal(isEquivalentTelemetry(a,b),false); assert.equal(isEquivalentTelemetry(a,structuredClone(a)),true);
 });
 
 const ORCH_CARBON = 'MODEL_PLACEHOLDER_M667';
@@ -252,6 +253,7 @@ test('Orchestrator (Carbon) direct/planning and inferred compaction steps resolv
 
 test('Orchestrator (Argon) resolves to orch-argon, annotates upstream ID, and is not misclassified as Carbon', async () => {
   const h = backendHarness({
+    clock: () => PROMO_CLOCK_MS,
     summaries: { test: { stepCount: 1 } },
     trajectories: {
       test: {
@@ -335,12 +337,12 @@ test('real-world M669 worker steps (responseModel gemini-flash-worker-agy, displ
   assert.equal(s2.modelShort, 'hydrogen-4');
   assert.equal(s2.modelLabel, 'Orchestrator Worker (Hydrogen)');
   assert.equal(s2.modelUpstream, 'gemini-flash-worker-agy (hydrogen-4)');
-  assert.equal(s2.costUsd, 0.0103);
+  assert.equal(s2.costUsd, 0.0097);
 
   assert.equal(s3.modelShort, 'hydrogen-4');
   assert.equal(s3.modelLabel, 'Orchestrator Worker (Hydrogen)');
   assert.equal(s3.modelUpstream, 'gemini-flash-worker-agy (hydrogen-4)');
-  assert.equal(s3.costUsd, 0.0103);
+  assert.equal(s3.costUsd, 0.0097);
 
   assert.equal(p.consumption.account.unpricedCalls, 0);
   const orchRow = p.modelBreakdown.find((m) => m.label === 'Orchestrator (Carbon)');
@@ -388,7 +390,7 @@ test('new Carbon (M427/M437/M438) and Hydrogen XHigh/High/Medium/Low (M525-M528)
   assert.equal(xhigh.shortName, 'hydrogen-4-xhigh');
   assert.equal(xhigh.baseLabel, 'Gemini 4 Hydrogen');
   assert.equal(xhigh.pricing.input, 1.5);
-  assert.equal(xhigh.pricing.cache, 0.15);
+  assert.equal(xhigh.pricing.cache, 0.075);
   assert.equal(xhigh.pricing.output, 7.5);
   assert.equal(resolveModelInfo('MODEL_PLACEHOLDER_M525').shortName, 'hydrogen-4-high');
   assert.equal(resolveModelInfo('MODEL_PLACEHOLDER_M526').shortName, 'hydrogen-4');
@@ -480,5 +482,296 @@ test('orchestratorIdMode defaults to compact, persists via settings action, and 
   assert.equal(
     resolveModelDisplayInfo(directHydrogen, { showUpstreamModel: false, orchestratorIdMode: 'full' }, { preferLabelInShort: true }).text,
     'Gemini 4 Hydrogen (XHigh)'
+  );
+});
+
+test('historical placeholders (M15/M16/M47/M84/M132/M133/M264/M330) and verified internal routing slugs resolve and price accurately without wildcarding unknown slugs', () => {
+  const { resolveModelInfo } = backendHarness({ clock: () => PROMO_CLOCK_MS });
+
+  const expectedPlaceholders = [
+    ['MODEL_PLACEHOLDER_M84', 'flash-3.5-high', 1.5, 9.0],
+    ['MODEL_PLACEHOLDER_M15', 'flash-3.5-high', 1.5, 9.0],
+    ['MODEL_PLACEHOLDER_M132', 'flash-3.5-high', 1.5, 9.0],
+    ['MODEL_PLACEHOLDER_M133', 'flash-3.5', 1.5, 9.0],
+    ['MODEL_PLACEHOLDER_M47', 'flash-3', 0.5, 3.0],
+    ['MODEL_PLACEHOLDER_M16', 'pro-3.1-high', 2.0, 12.0],
+    ['MODEL_PLACEHOLDER_M264', 'flash-3.6-high', 0.75, 3.75],
+    ['MODEL_PLACEHOLDER_M330', 'flash-2.5-lite', 0.1, 0.4],
+  ];
+  for (const [ph, shortName, inputPrice, outputPrice] of expectedPlaceholders) {
+    const info = resolveModelInfo(ph);
+    assert.equal(info.shortName, shortName, `${ph} shortName`);
+    assert.ok(info.pricing, `${ph} should have pricing`);
+    assert.equal(info.pricing.input, inputPrice, `${ph} input price`);
+    assert.equal(info.pricing.output, outputPrice, `${ph} output price`);
+  }
+
+  const expectedSlugs = [
+    ['gemini-3-flash-a', 'flash-3.5', 1.5, 9.0],
+    ['gemini-3-flash-b', 'flash-3.5', 1.5, 9.0],
+    ['gemini-3-flash-c', 'flash-3', 0.5, 3.0],
+    ['gemini-3-flash-d', 'flash-3.5', 1.5, 9.0],
+    ['gemini-3-flash-agent', 'flash-3.5', 1.5, 9.0],
+    ['gemini-pro-default', 'pro-3.1', 2.0, 12.0],
+    ['gemini-pro-agent', 'pro-3.1', 2.0, 12.0],
+    ['gemini-pro-b', 'pro-3.1', 2.0, 12.0],
+    ['gemini-3.7-flash-safety-le', 'flash-3.7', 0.75, 3.75],
+    ['gemini-3.8-flash-n', 'flash-3.8', 0.75, 3.75],
+    ['gemini-4-argon-f', 'argon-4', 2.0, 10.0],
+    ['gemini-4-argon-disabled', 'argon-4', 2.0, 10.0],
+  ];
+  for (const [slug, shortName, inputPrice, outputPrice] of expectedSlugs) {
+    const info = resolveModelInfo(slug);
+    assert.equal(info.shortName, shortName, `${slug} shortName`);
+    assert.ok(info.pricing, `${slug} should have pricing`);
+    assert.equal(info.pricing.input, inputPrice, `${slug} input price`);
+    assert.equal(info.pricing.output, outputPrice, `${slug} output price`);
+  }
+
+  // Unverified future variant must still remain unpriced (no reckless prefix fallback)
+  const unknownVariant = resolveModelInfo('gemini-3.1-pro-ultra-v2');
+  assert.equal(unknownVariant.pricing, null);
+});
+
+test('deep_stats session-display mislabeling is ignored when step-intrinsic model differs, and micro-costs preserve 6-decimal precision', async () => {
+  const nowIso = new Date(Date.now() - 5_000).toISOString();
+  const h = backendHarness({
+    summaries: {
+      ide_convo: { stepCount: 1 },
+    },
+    trajectories: {
+      ide_convo: {
+        trajectory: {
+          steps: [
+            {
+              type: 'CORTEX_STEP_TYPE_PLANNER_RESPONSE',
+              status: 'CORTEX_STEP_STATUS_DONE',
+              metadata: {
+                sourceTrajectoryStepInfo: { stepIndex: 1 },
+                createdAt: nowIso,
+                completedAt: new Date(Date.now() - 4_000).toISOString(),
+                modelUsage: {
+                  model: 'MODEL_GOOGLE_GEMINI_2_5_FLASH_LITE',
+                  apiProvider: 'API_PROVIDER_GOOGLE_GEMINI',
+                  inputTokens: '1900',
+                  cacheReadTokens: '0',
+                  outputTokens: '107',
+                },
+              },
+            },
+          ],
+        },
+      },
+    },
+    deepStats: {
+      perConvo: {
+        'standalone:11111111-2222-3333-4444-555555555555': {
+          appSource: 'standalone',
+          entries: [
+            {
+              ts: nowIso,
+              model: 'gemini-2.5-flash-lite',
+              modelCanonicalId: 'gemini-2.5-flash-lite',
+              modelAggregationId: 'session-display:gemini-3-5-flash-lite',
+              modelDisplayName: 'Gemini 3.5 Flash Lite',
+              provider: 'API_PROVIDER_GOOGLE_GEMINI',
+              inp: 12300,
+              cache: 0,
+              out: 154,
+              reasoning: 0,
+            },
+            {
+              ts: nowIso,
+              model: 'gemini-3-flash-a',
+              modelCanonicalId: 'gemini-3-flash-a',
+              modelAggregationId: 'session:gemini-3-flash-a',
+              provider: 'API_PROVIDER_GOOGLE_GEMINI',
+              inp: 3320000,
+              cache: 32730000,
+              out: 120000,
+              reasoning: 195500,
+            },
+          ],
+        },
+      },
+    },
+  });
+
+  const p = await h.buildTelemetryPayloadInternal('ide_convo');
+  const consumptionModels = p.modelBreakdown;
+
+  // Both gemini-2.5-flash-lite calls (IDE + standalone with session-display:gemini-3-5-flash-lite) merge into one Gemini 2.5 Flash Lite bucket!
+  const flash25Rows = consumptionModels.filter((m) => /2\.5 Flash Lite/i.test(m.label));
+  assert.equal(flash25Rows.length, 1);
+  assert.equal(
+    consumptionModels.some((m) => /3\.5 Flash Lite/i.test(m.label)),
+    false,
+    'mismatched session-display:gemini-3-5-flash-lite should not create a bogus Gemini 3.5 Flash Lite bucket'
+  );
+  assert.equal(flash25Rows[0].calls, 2);
+  assert.equal(flash25Rows[0].unpricedCalls, 0);
+  // 14,200 input * $0.10/M + 261 output * $0.40/M = $0.0015244 -> 0.001524 (> 0, not truncated to 0!)
+  assert.equal(flash25Rows[0].costUsd, 0.001524);
+
+  // Also check single-step micro-cost (< $0.001) on activeConversation.modelBreakdown
+  const sessionFlash25 = p.activeConversation.modelBreakdown.find((m) => /2\.5 Flash Lite/i.test(m.label));
+  assert.ok(sessionFlash25);
+  // 1,900 * $0.10/M + 107 * $0.40/M = $0.0002328 -> 0.000233
+  assert.equal(sessionFlash25.costUsd, 0.000233);
+  assert.equal(formatUsd(sessionFlash25.costUsd, { precise: true }), '<$0.001');
+  assert.equal(formatUsd(flash25Rows[0].costUsd, { precise: true }), '$0.002');
+
+  // Standalone session:gemini-3-flash-a entry preserves responseModel & prices cleanly
+  const flash35Row = consumptionModels.find((m) => m.label === 'Gemini 3.5 Flash');
+  assert.ok(flash35Row);
+  assert.equal(flash35Row.upstreamName, 'gemini-3-flash-a');
+  assert.equal(flash35Row.unpricedCalls, 0);
+  assert.ok(flash35Row.costUsd > 12);
+});
+
+test('mergeModelsByDisplayName collapses distinct backend buckets that share the same rendered display text', () => {
+  const rawModels = [
+    {
+      label: 'Gemini 3.8 Flash',
+      shortName: 'flash-3.8',
+      upstreamName: 'gemini-3-flash-a',
+      upstreamModels: ['gemini-3-flash-a', 'gemini-3.8-flash'],
+      calls: 7063,
+      inputTokens: 91_800_000,
+      cacheReadTokens: 674_810_000,
+      outputTokens: 5_510_000,
+      thinkingTokens: 3_130_000,
+      responseTokens: 2_380_000,
+      totalTokens: 772_120_000,
+      costUsd: 286.2,
+      unpricedCalls: 0,
+      avgTokPerSec: 120,
+      speedSummary: { sampleCount: 100, excludedCount: 5, avgTokPerSec: 120 },
+      avgTtftSec: 2.0,
+      ttftSampleCount: 100,
+    },
+    {
+      label: 'Gemini 3.5 Flash',
+      shortName: 'flash-3.5',
+      upstreamName: 'gemini-3-flash-a',
+      upstreamModels: ['gemini-3-flash-a'],
+      calls: 449,
+      inputTokens: 3_320_000,
+      cacheReadTokens: 32_730_000,
+      outputTokens: 315_500,
+      thinkingTokens: 195_500,
+      responseTokens: 120_000,
+      totalTokens: 36_365_500,
+      costUsd: 12.73,
+      unpricedCalls: 0,
+      avgTokPerSec: 80,
+      speedSummary: { sampleCount: 100, excludedCount: 2, avgTokPerSec: 80 },
+      avgTtftSec: 4.0,
+      ttftSampleCount: 100,
+    },
+  ];
+
+  // In upstream mode, both resolve to 'gemini-3-flash-a' -> merged into 1 row!
+  const mergedUpstream = mergeModelsByDisplayName(
+    rawModels,
+    { showUpstreamModel: true },
+    { preferLabelInShort: true }
+  );
+  assert.equal(mergedUpstream.length, 1);
+  assert.equal(mergedUpstream[0].displayText, 'gemini-3-flash-a');
+  assert.equal(mergedUpstream[0].calls, 7512);
+  assert.equal(mergedUpstream[0].totalTokens, 808_485_500);
+  assert.equal(mergedUpstream[0].costUsd, 298.93);
+  assert.equal(mergedUpstream[0].avgTokPerSec, 100);
+  assert.equal(mergedUpstream[0].avgTtftSec, 3);
+  assert.deepEqual(mergedUpstream[0].sourceLabels, ['Gemini 3.8 Flash', 'Gemini 3.5 Flash']);
+
+  // In friendly label mode, 'Gemini 3.8 Flash' and 'Gemini 3.5 Flash' stay distinct!
+  const mergedShort = mergeModelsByDisplayName(
+    rawModels,
+    { showUpstreamModel: false },
+    { preferLabelInShort: true }
+  );
+  assert.equal(mergedShort.length, 2);
+});
+
+test('Orchestrator (Neon) M537 and Gemini 4 Neon M532 resolve cleanly without mislabeling as orchestrator-carbon', async () => {
+  const { resolveModelInfo, formatUpstreamModelId, isCarbonModelIdentifier, isNeonModelIdentifier } =
+    backendHarness({ clock: () => PROMO_CLOCK_MS });
+
+  assert.equal(isNeonModelIdentifier('MODEL_PLACEHOLDER_M537', 'gemini-pro-orchestrator-neon', 'Orchestrator (Neon)'), true);
+  assert.equal(isCarbonModelIdentifier('MODEL_PLACEHOLDER_M537', 'gemini-pro-orchestrator-neon', 'Orchestrator (Neon)'), false);
+  assert.equal(isCarbonModelIdentifier('gemini-pro-orchestrator-neon'), false);
+  assert.equal(isCarbonModelIdentifier('MODEL_PLACEHOLDER_M667', 'gemini-pro-orchestrator', 'Orchestrator (Carbon)'), true);
+
+  const m537Info = resolveModelInfo('MODEL_PLACEHOLDER_M537', new Map(), 'API_PROVIDER_GOOGLE_GEMINI', 'Orchestrator (Neon)', 'gemini-pro-orchestrator-neon');
+  assert.equal(m537Info.shortName, 'orch-neon');
+  assert.equal(m537Info.baseLabel, 'Orchestrator (Neon)');
+  assert.equal(m537Info.pricing.input, 3.0);
+  assert.equal(m537Info.pricing.output, 15.0);
+  assert.equal(formatUpstreamModelId('gemini-pro-orchestrator-neon', m537Info), 'gemini-pro-orchestrator-neon (neon-4)');
+
+  const m532Info = resolveModelInfo('MODEL_PLACEHOLDER_M532');
+  assert.equal(m532Info.shortName, 'neon-4-high');
+  assert.equal(m532Info.baseLabel, 'Gemini 4 Neon');
+
+  const neonRow = {
+    type: 'CORTEX_STEP_TYPE_PLANNER_RESPONSE',
+    status: 'CORTEX_STEP_STATUS_DONE',
+    metadata: {
+      sourceTrajectoryStepInfo: { stepIndex: 208 },
+      createdAt: new Date(createdAtMs).toISOString(),
+      completedAt: new Date(createdAtMs + 10_000).toISOString(),
+      modelUsage: {
+        model: 'MODEL_PLACEHOLDER_M537',
+        responseModel: 'gemini-pro-orchestrator-neon',
+        apiProvider: 'API_PROVIDER_GOOGLE_GEMINI',
+        inputTokens: '1000',
+        cacheReadTokens: '9000',
+        outputTokens: '1000',
+      },
+    },
+  };
+  const neonPayload = await payload([neonRow], {
+    trajectories: {
+      test: {
+        trajectory: {
+          steps: [neonRow],
+          generatorMetadata: [
+            {
+              stepIndices: [208],
+              chatModel: {
+                model: 'MODEL_PLACEHOLDER_M537',
+                responseModel: 'gemini-pro-orchestrator-neon',
+                modelDisplayName: 'Orchestrator (Neon)',
+              },
+            },
+          ],
+        },
+      },
+    },
+  });
+
+  const st = neonPayload.activeConversation.recentSteps[0];
+  assert.equal(st.modelShort, 'orch-neon');
+  assert.equal(st.modelLabel, 'Orchestrator (Neon)');
+  assert.equal(st.modelUpstream, 'gemini-pro-orchestrator-neon (neon-4)');
+  assert.equal(neonPayload.modelBreakdown[0].label, 'Orchestrator (Neon)');
+  assert.equal(neonPayload.quotas?.pools?.some((p) => p.poolKey === 'Carbon'), false);
+
+  const orchNeonModel = {
+    modelKey: 'MODEL_PLACEHOLDER_M537',
+    modelShort: 'orch-neon',
+    modelLabel: 'Orchestrator (Neon)',
+    modelUpstream: 'gemini-pro-orchestrator-neon (neon-4)',
+    responseModel: 'gemini-pro-orchestrator-neon',
+  };
+  assert.equal(
+    resolveModelDisplayInfo(orchNeonModel, { orchestratorIdMode: 'compact' }).text,
+    'orchestrator-neon'
+  );
+  assert.equal(
+    resolveModelDisplayInfo(orchNeonModel, { orchestratorIdMode: 'full' }).text,
+    'gemini-pro-orchestrator-neon (neon-4)'
   );
 });

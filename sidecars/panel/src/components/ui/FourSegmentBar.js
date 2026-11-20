@@ -33,14 +33,30 @@ export function createFourSegmentBar() {
   ]);
 
   /**
-   * 根据四类 Token 数量重新计算并写入各分段百分比宽度。
+   * 根据四类 Token 数量与整体行宽占比系数 (`scaleRatio`，默认 `1` 占满 100%) 重新计算并写入各分段百分比宽度。
    */
-  function update({ inputTokens = 0, cacheReadTokens = 0, responseTokens = 0, thinkingTokens = 0 }) {
-    const total = Math.max(1, inputTokens + cacheReadTokens + responseTokens + thinkingTokens);
-    patchStyleVar(segInput, '--seg-w', `${((inputTokens / total) * 100).toFixed(2)}%`);
-    patchStyleVar(segCached, '--seg-w', `${((cacheReadTokens / total) * 100).toFixed(2)}%`);
-    patchStyleVar(segOutput, '--seg-w', `${((responseTokens / total) * 100).toFixed(2)}%`);
-    patchStyleVar(segThinking, '--seg-w', `${((thinkingTokens / total) * 100).toFixed(2)}%`);
+  function update({
+    inputTokens = 0,
+    cacheReadTokens = 0,
+    responseTokens = 0,
+    thinkingTokens = 0,
+    scaleRatio = 1,
+  }) {
+    const sum = inputTokens + cacheReadTokens + responseTokens + thinkingTokens;
+    const clampedRatio = Number.isFinite(Number(scaleRatio))
+      ? Math.min(1, Math.max(0, Number(scaleRatio)))
+      : 1;
+    if (sum <= 0 || clampedRatio <= 0) {
+      patchStyleVar(segInput, '--seg-w', '0%');
+      patchStyleVar(segCached, '--seg-w', '0%');
+      patchStyleVar(segOutput, '--seg-w', '0%');
+      patchStyleVar(segThinking, '--seg-w', '0%');
+      return;
+    }
+    patchStyleVar(segInput, '--seg-w', `${((inputTokens / sum) * 100 * clampedRatio).toFixed(2)}%`);
+    patchStyleVar(segCached, '--seg-w', `${((cacheReadTokens / sum) * 100 * clampedRatio).toFixed(2)}%`);
+    patchStyleVar(segOutput, '--seg-w', `${((responseTokens / sum) * 100 * clampedRatio).toFixed(2)}%`);
+    patchStyleVar(segThinking, '--seg-w', `${((thinkingTokens / sum) * 100 * clampedRatio).toFixed(2)}%`);
   }
 
   return { el, update };

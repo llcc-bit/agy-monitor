@@ -685,6 +685,8 @@ See the [LICENSE](LICENSE) file for details.
 ---
 
 Modified 2026-11-20 by llcc-bit (https://github.com/llcc-bit/agy-monitor):
+- Rebased onto upstream v1.5.2 (i18n, Desktop/IDE/CLI/Standalone support, 154+ model catalog).
 - Added lightweight real-time token generation speed badge below the chat composer input.
 - Added TTFT-adjusted decode speed calculation with buffered-burst filtering and sliding-window live estimation.
+- Fixed Orchestrator (Neon) / Gemini 4 Neon misidentification as orchestrator-carbon.
 - Reconfigured repository metadata and default update mode (`off`) for the `agy-monitor` fork.

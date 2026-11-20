@@ -27,30 +27,41 @@
   background: var(--surface-panel);
 }
 
+.table-viewport.is-step-table {
+  overflow-x: auto;
+  overflow-anchor: none;
+}
+
 /* --- 2. 粘性表头数据表 (Sticky-Header Data Table) --- */
 .data-table {
   width: 100%;
   border-collapse: collapse;
-  font-size: 11px;
+  font-size: var(--fs-base-sm);
 }
 
 .data-table th,
 .data-table td {
-  padding: 5px 4px;
+  padding: calc(5px * var(--ui-font-scale, 1)) calc(4px * var(--ui-font-scale, 1));
   text-align: left;
+  font-size: var(--fs-base-sm);
   border-bottom: 1px solid var(--border-hairline);
   white-space: nowrap;
 }
 
+.data-table th.is-right,
+.data-table td.is-right {
+  text-align: right;
+}
+
 .data-table th:first-child,
 .data-table td:first-child {
-  padding-left: 7px;
+  padding-left: 2px;
 }
 
 .data-table th:last-child,
 .data-table td:last-child {
   text-align: right;
-  padding-right: 10px;
+  padding-right: 4px;
 }
 
 .data-table th {
@@ -62,8 +73,69 @@
   font-weight: 600;
 }
 
-.data-table tbody tr:hover {
+.data-table tbody tr:not(.step-vspacer):not(.step-vsizer):hover {
   background: var(--surface-hover);
+}
+
+.data-table tbody tr.step-vspacer,
+.data-table tbody tr.step-vspacer:hover,
+.data-table tbody tr.step-vsizer,
+.data-table tbody tr.step-vsizer:hover {
+  background: transparent !important;
+  pointer-events: none;
+}
+
+.data-table tbody tr.step-vsizer {
+  visibility: hidden;
+  height: 0;
+}
+
+.data-table tbody tr.step-vsizer td {
+  padding-top: 0 !important;
+  padding-bottom: 0 !important;
+  border: none !important;
+  line-height: 0;
+  height: 0;
+}
+
+.step-vsizer-inner {
+  display: block;
+  height: 0;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.data-table tbody tr.step-vspacer td.step-vspacer-cell {
+  padding: 0 !important;
+  border: none !important;
+  line-height: 0;
+}
+
+.step-model-cell {
+  display: inline-flex;
+  align-items: baseline;
+  max-width: calc(var(--step-model-max-w, 176px) * var(--ui-font-scale, 1));
+  min-width: 0;
+  vertical-align: bottom;
+}
+
+.step-model-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  flex: 0 1 auto;
+}
+
+.step-model-compact {
+  flex-shrink: 0;
+  white-space: nowrap;
+  color: var(--accent-primary);
+  font-weight: 500;
+}
+
+.step-model-compact[hidden] {
+  display: none !important;
 }
 
 .steps-panel-header {
@@ -88,19 +160,891 @@
   flex-shrink: 0;
 }
 
-.steps-inline-scope-select {
-  flex: 0 1 180px;
+.steps-inline-scope-select,
+.steps-inline-model-select {
+  flex: 0 1 165px;
   min-width: 72px;
-  max-width: 190px;
+  max-width: 175px;
 }
 
-.steps-inline-scope-select .select-trigger {
-  height: 22px;
-  padding: 0 6px;
+.steps-inline-scope-select .select-trigger,
+.steps-inline-model-select .select-trigger {
+  min-height: calc(22px * var(--ui-font-scale, 1));
+  height: auto;
+  padding: 2px 6px;
   gap: 4px;
   min-width: 0;
   overflow: hidden;
-  font-size: 11px;
+  font-size: var(--fs-md);
   border: 1px solid var(--border-hairline);
   background: var(--surface-subtle);
+}
+
+/* --- 2.5 极简对话轮次导轨与起点圆点 (Minimalist Turn Rail & Prompt Preview) --- */
+.steps-data-table.has-turn-rail th:first-child,
+.steps-data-table.has-turn-rail td:first-child {
+  padding-left: 17px;
+}
+
+.steps-data-table td:first-child {
+  position: relative;
+}
+
+.turn-rail {
+  --rail-line: color-mix(in srgb, var(--text-secondary) 28%, var(--border-hairline));
+  --rail-dot: color-mix(in srgb, var(--accent-primary) 52%, var(--text-secondary));
+  position: absolute;
+  top: 0;
+  bottom: -1px;
+  left: 5px;
+  width: 8px;
+  pointer-events: none;
+}
+
+.turn-rail.is-latest {
+  --rail-line: color-mix(in srgb, var(--accent-primary) 62%, var(--surface-panel));
+  --rail-dot: var(--accent-primary);
+}
+
+.steps-data-table tbody tr:hover .turn-rail {
+  --rail-line: color-mix(in srgb, var(--accent-primary) 78%, var(--surface-panel));
+  --rail-dot: var(--accent-primary);
+}
+
+.turn-rail::before {
+  content: '';
+  position: absolute;
+  left: 3.25px;
+  width: 1.5px;
+  background: var(--rail-line);
+}
+
+.turn-rail:not(.has-up):not(.has-down)::before {
+  display: none;
+}
+
+.turn-rail.has-up.has-down::before {
+  top: 0;
+  bottom: 0;
+}
+
+.turn-rail.has-up:not(.has-down)::before {
+  top: 0;
+  bottom: 50%;
+}
+
+.turn-rail.has-down:not(.has-up)::before {
+  top: 50%;
+  bottom: 0;
+}
+
+.turn-rail.is-cap::after,
+.turn-rail.is-origin::after {
+  content: '';
+  box-sizing: border-box;
+  position: absolute;
+  top: 50%;
+  left: 4px;
+  transform: translate(-50%, -50%);
+  border-radius: var(--radius-pill);
+}
+
+.turn-rail.is-cap::after {
+  width: 3.5px;
+  height: 3.5px;
+  background: var(--rail-line);
+}
+
+.turn-rail.is-origin::after {
+  width: 6px;
+  height: 6px;
+  background: var(--surface-panel);
+  border: 1.5px solid var(--rail-dot);
+  box-shadow: 0 0 0 1px var(--surface-panel);
+}
+
+.turn-rail.is-latest.is-origin::after {
+  background: var(--rail-dot);
+}
+
+.turn-rail[hidden],
+.turn-prompt-tip[hidden] {
+  display: none !important;
+}
+
+/* 极简紧凑提问文本悬停预览气泡 */
+.turn-prompt-tip {
+  position: absolute;
+  z-index: 45;
+  max-width: min(286px, calc(100% - 16px));
+  padding: 5px 8px;
+  font-size: var(--fs-sm);
+  line-height: 1.42;
+  color: var(--text-primary);
+  background: var(--surface-panel);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-xs);
+  box-shadow: var(--shadow-popover);
+  white-space: pre-line;
+  word-break: break-word;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  overflow: hidden;
+  pointer-events: none;
+  animation: anim-popover-in var(--dur-instant) var(--ease-fast);
+}
+
+/* --- 2.6 单步异常整行语义着色、模型汇总微标、筛选条与悬停诊断卡 --- */
+.data-table tbody tr.is-anomaly-warn {
+  background: color-mix(in srgb, var(--metric-warn) 11%, transparent);
+}
+
+.data-table tbody tr.is-anomaly-warn:hover {
+  background: color-mix(in srgb, var(--metric-warn) 18%, transparent);
+}
+
+.data-table tbody tr.is-anomaly-warn td:first-child {
+  box-shadow: inset 2px 0 0 var(--metric-warn);
+}
+
+.data-table tbody tr.is-anomaly-warn td:first-child > span:not(.agent-badge):not(.turn-rail) {
+  color: var(--metric-warn);
+  font-weight: 600;
+}
+
+.data-table tbody tr.is-anomaly-danger {
+  background: color-mix(in srgb, var(--metric-danger) 13%, transparent);
+}
+
+.data-table tbody tr.is-anomaly-danger:hover {
+  background: color-mix(in srgb, var(--metric-danger) 20%, transparent);
+}
+
+.data-table tbody tr.is-anomaly-danger td:first-child {
+  box-shadow: inset 2px 0 0 var(--metric-danger);
+}
+
+.data-table tbody tr.is-anomaly-danger td:first-child > span:not(.agent-badge):not(.turn-rail) {
+  color: var(--metric-danger);
+  font-weight: 600;
+}
+
+.step-anomaly-tag {
+  display: inline-flex;
+  align-items: center;
+  vertical-align: middle;
+  margin-left: 4px;
+  padding: 0 3.5px;
+  font-size: var(--fs-2xs);
+  font-weight: 600;
+  line-height: 1.35;
+  border-radius: 3px;
+  color: var(--metric-warn);
+  background: var(--metric-warn-soft);
+  border: 1px solid color-mix(in srgb, var(--metric-warn) 34%, transparent);
+  cursor: help;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.step-anomaly-tag.is-danger {
+  color: var(--metric-danger);
+  background: var(--metric-danger-soft);
+  border-color: color-mix(in srgb, var(--metric-danger) 36%, transparent);
+}
+
+.step-anomaly-tag[hidden] {
+  display: none !important;
+}
+
+.smodel-anomaly-tag {
+  margin-left: 0;
+  cursor: pointer;
+  font-family: inherit;
+  transition:
+    background-color var(--dur-instant) var(--ease-fast),
+    border-color var(--dur-instant) var(--ease-fast);
+}
+
+.smodel-anomaly-tag:hover {
+  background: color-mix(in srgb, var(--metric-warn) 22%, transparent);
+}
+
+.smodel-anomaly-tag.is-danger:hover {
+  background: color-mix(in srgb, var(--metric-danger) 22%, transparent);
+}
+
+.step-anomaly-tip {
+  position: absolute;
+  z-index: 46;
+  max-width: min(300px, calc(100% - 16px));
+  min-width: 176px;
+  padding: 7px 9px;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  font-size: var(--fs-sm);
+  line-height: 1.38;
+  color: var(--text-primary);
+  background: var(--surface-panel);
+  border: 1px solid color-mix(in srgb, var(--metric-warn) 42%, var(--border-strong));
+  border-radius: var(--radius-xs);
+  box-shadow: var(--shadow-popover);
+  pointer-events: none;
+  animation: anim-popover-in var(--dur-instant) var(--ease-fast);
+}
+
+.step-anomaly-tip.is-danger {
+  border-color: color-mix(in srgb, var(--metric-danger) 46%, var(--border-strong));
+}
+
+.step-anomaly-tip[hidden],
+.step-anomaly-tip-sub[hidden],
+.step-anomaly-tip-list[hidden],
+.step-anomaly-tip-hint[hidden] {
+  display: none !important;
+}
+
+.step-anomaly-tip-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.step-anomaly-tip-title {
+  font-weight: 600;
+  color: var(--metric-warn);
+  white-space: nowrap;
+}
+
+.step-anomaly-tip.is-danger .step-anomaly-tip-title {
+  color: var(--metric-danger);
+}
+
+.step-anomaly-tip-sub {
+  font-size: var(--fs-xs);
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.step-anomaly-tip-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding-top: 4px;
+  border-top: 1px solid var(--border-hairline);
+}
+
+.step-anomaly-tip-item {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.step-anomaly-tip-row {
+  font-size: var(--fs-xs);
+  font-weight: 500;
+  color: var(--text-primary);
+}
+
+.step-anomaly-tip-row.is-danger {
+  color: var(--metric-danger);
+}
+
+.step-anomaly-tip-detail {
+  font-size: var(--fs-2xs);
+  line-height: 1.35;
+  color: var(--text-muted);
+  word-break: break-word;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+}
+
+.step-anomaly-tip-hint {
+  font-size: var(--fs-2xs);
+  color: var(--text-muted);
+  padding-top: 3px;
+  border-top: 1px solid var(--border-hairline);
+}
+
+.steps-anomaly-filterbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 4px 8px;
+  border-top: 1px solid var(--border-hairline);
+  background: color-mix(in srgb, var(--metric-warn) 8%, var(--surface-panel));
+  font-size: var(--fs-xs);
+}
+
+.steps-anomaly-filterbar[hidden] {
+  display: none !important;
+}
+
+.steps-anomaly-filter-label {
+  font-weight: 600;
+  color: var(--metric-warn);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.steps-anomaly-filter-clear {
+  flex-shrink: 0;
+  padding: 1px 7px;
+  font-size: var(--fs-xs);
+}
+
+.steps-anomaly-strip {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 6px;
+  padding: 4px 8px;
+  border: 1px solid color-mix(in srgb, var(--metric-warn) 26%, var(--border-hairline));
+  border-radius: var(--radius-xs);
+  background: color-mix(in srgb, var(--metric-warn) 7%, var(--surface-panel));
+}
+
+.steps-anomaly-strip[hidden] {
+  display: none !important;
+}
+
+.steps-anomaly-strip-meta {
+  border: none;
+  background: transparent;
+  padding: 0;
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  color: var(--metric-warn);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.steps-anomaly-strip-meta:hover {
+  text-decoration: underline;
+}
+
+.steps-anomaly-strip-tags {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+/* --- 3. 按模型汇总分析视图：双趋势图与极简模型总览 (Models Analytics Pane) --- */
+.models-analytics-pane {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--space-3) 0 2px;
+}
+
+.sstep-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: var(--space-3) var(--space-4);
+  background: var(--surface-panel);
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-xs);
+}
+
+.sstep-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
+}
+
+.sstep-card-title-group {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+  flex-shrink: 0;
+}
+
+.sstep-card-title {
+  font-size: var(--fs-base);
+  font-weight: 600;
+  color: var(--text-primary);
+  white-space: nowrap;
+}
+
+.sstep-card .seg-btn {
+  padding: 2px 6px;
+  font-size: var(--fs-sm);
+}
+
+.sstep-fit-controls {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
+}
+
+.sstep-fit-model-select {
+  min-width: 96px;
+  max-width: 176px;
+}
+
+.sstep-fit-model-select .select-trigger {
+  min-height: calc(22px * var(--ui-font-scale, 1));
+  height: auto;
+  padding: 2px 6px;
+  gap: 4px;
+  min-width: 0;
+  overflow: hidden;
+  font-size: var(--fs-sm);
+  border: 1px solid var(--border-hairline);
+  background: var(--surface-subtle);
+}
+
+.sstep-chart-wrap {
+  position: relative;
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.sstep-plot-stage {
+  position: relative;
+  width: 100%;
+  padding-top: 4px;
+  cursor: crosshair;
+}
+
+.sstep-svg {
+  width: 100%;
+  height: 106px;
+  display: block;
+  overflow: visible;
+}
+
+.sstep-fit-svg {
+  height: 136px;
+}
+
+.sstep-sci-grid line {
+  stroke: var(--border-hairline);
+  stroke-width: 0.9;
+  stroke-dasharray: 2 3;
+}
+
+.sstep-axis-spine {
+  stroke: var(--border-strong);
+  stroke-width: 1;
+  shape-rendering: crispEdges;
+}
+
+.sstep-axis-tick {
+  stroke: var(--border-strong);
+  stroke-width: 1;
+  shape-rendering: crispEdges;
+}
+
+.sstep-axis-label {
+  fill: var(--text-muted);
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace);
+  font-size: var(--fs-2xs);
+  user-select: none;
+  pointer-events: none;
+}
+
+.sstep-axis-label.is-y-inline {
+  paint-order: stroke;
+  stroke: var(--surface-panel);
+  stroke-width: 2.5px;
+  stroke-linejoin: round;
+}
+
+.sstep-line-card .trend-line {
+  stroke: var(--sstep-accent, var(--ctx-cached));
+  stroke-width: 1.9;
+}
+
+.sstep-multi-area {
+  fill: var(--sstep-series-color, var(--ctx-cached));
+  fill-opacity: 0.08;
+  stroke: none;
+  pointer-events: none;
+}
+
+.sstep-series-single-dot {
+  fill: var(--sstep-series-color, var(--ctx-cached));
+  stroke: var(--surface-panel);
+  stroke-width: 1.3;
+}
+
+.sstep-svg .trend-hover-dot {
+  stroke: var(--hover-dot-color, var(--sstep-accent, var(--accent-primary)));
+}
+
+.sstep-line-card .trend-peak-pill {
+  background: color-mix(in srgb, var(--sstep-accent, var(--ctx-cached)) 14%, var(--surface-panel));
+  border-color: color-mix(in srgb, var(--sstep-accent, var(--ctx-cached)) 30%, var(--border-hairline));
+}
+
+.sstep-node-dot {
+  fill: var(--surface-panel);
+  stroke: var(--dot-stroke, var(--sstep-accent, var(--ctx-cached)));
+  stroke-width: 1.45;
+}
+
+.sstep-node-dot.is-skipped {
+  fill: transparent;
+  stroke: var(--border-strong);
+  stroke-width: 1;
+  stroke-dasharray: 1.5 1.5;
+  opacity: 0.65;
+}
+
+.sstep-ci-band {
+  fill: var(--sstep-fit-accent, var(--ctx-cached));
+  fill-opacity: 0.14;
+  stroke: var(--sstep-fit-accent, var(--ctx-cached));
+  stroke-opacity: 0.24;
+  stroke-width: 0.75;
+  pointer-events: none;
+}
+
+.sstep-ci-band.is-multi {
+  fill-opacity: 0.1;
+  stroke-opacity: 0.18;
+}
+
+.sstep-fit-line {
+  stroke: var(--sstep-fit-accent, var(--ctx-cached));
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.sstep-ols-line {
+  stroke: color-mix(in srgb, var(--text-secondary) 72%, var(--surface-panel));
+  stroke-width: 1.1;
+  stroke-dasharray: 3.5 3;
+}
+
+.sstep-scatter-dot {
+  fill: color-mix(in srgb, var(--sstep-fit-accent, var(--ctx-cached)) 48%, var(--text-secondary) 52%);
+  fill-opacity: 0.42;
+  stroke: none;
+}
+
+.sstep-scatter-dot.is-multi {
+  fill: var(--sstep-fit-accent, var(--ctx-cached));
+  fill-opacity: 0.48;
+}
+
+.sstep-fit-svg .trend-hover-dot {
+  stroke: var(--hover-dot-color, var(--accent-primary));
+}
+
+.sstep-hover-raw-dot {
+  fill: var(--surface-panel);
+  stroke: var(--text-primary);
+  stroke-width: 1.6;
+  pointer-events: none;
+}
+
+.sstep-hover-raw-dot.is-anomaly {
+  stroke: var(--metric-warn);
+  stroke-width: 1.85;
+}
+
+.sstep-hover-raw-dot.is-danger {
+  stroke: var(--metric-danger);
+}
+
+.sstep-anomaly-dot,
+.sstep-scatter-dot.is-anomaly {
+  fill: var(--surface-panel);
+  fill-opacity: 1;
+  stroke: var(--metric-warn);
+  stroke-width: 1.6;
+  pointer-events: none;
+}
+
+.sstep-anomaly-dot.is-danger,
+.sstep-scatter-dot.is-anomaly.is-danger {
+  stroke: var(--metric-danger);
+}
+
+.trend-tip-anomaly {
+  margin-top: 3px;
+  padding-top: 3px;
+  border-top: 1px solid var(--border-hairline);
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  color: var(--metric-warn);
+  white-space: nowrap;
+}
+
+.trend-tip-anomaly.is-danger {
+  color: var(--metric-danger);
+}
+
+.trend-tip-anomaly[hidden] {
+  display: none !important;
+}
+
+.sstep-empty-hint {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: var(--fs-md);
+  pointer-events: none;
+  z-index: 2;
+}
+
+.sstep-model-legend {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  padding-top: 2px;
+  font-size: var(--fs-xs);
+  color: var(--text-secondary);
+}
+
+.sstep-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  white-space: nowrap;
+}
+
+.sstep-legend-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: var(--radius-pill);
+  background: var(--swatch-bg, var(--ctx-cached));
+  flex-shrink: 0;
+}
+
+.sstep-legend-line {
+  width: 11px;
+  height: 2px;
+  border-radius: 1px;
+  background: var(--swatch-bg, var(--ctx-cached));
+  flex-shrink: 0;
+}
+
+.sstep-fit-legend[hidden],
+.sstep-model-legend[hidden] {
+  display: none !important;
+}
+
+.sstep-fit-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+  padding-top: 2px;
+  font-size: var(--fs-xs);
+  color: var(--text-muted);
+}
+
+.sstep-fit-legend {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px;
+  color: var(--text-secondary);
+}
+
+.sstep-fit-legend-ols {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.sstep-fit-legend-ols[hidden] {
+  display: none;
+}
+
+.sstep-fit-swatch {
+  display: inline-block;
+  flex-shrink: 0;
+}
+
+.sstep-fit-swatch.is-scatter {
+  width: 5.5px;
+  height: 5.5px;
+  border-radius: var(--radius-pill);
+  background: color-mix(in srgb, var(--sstep-fit-accent, var(--ctx-cached)) 48%, var(--text-secondary) 52%);
+  opacity: 0.68;
+}
+
+.sstep-fit-swatch.is-curve {
+  width: 11px;
+  height: 2px;
+  border-radius: 1px;
+  background: var(--sstep-fit-accent, var(--ctx-cached));
+  margin-left: 3px;
+}
+
+.sstep-fit-swatch.is-ci {
+  width: 10px;
+  height: 6.5px;
+  border-radius: 1px;
+  background: color-mix(in srgb, var(--sstep-fit-accent, var(--ctx-cached)) 22%, var(--surface-panel));
+  border: 0.75px solid color-mix(in srgb, var(--sstep-fit-accent, var(--ctx-cached)) 42%, transparent);
+  margin-left: 3px;
+}
+
+.sstep-fit-swatch.is-ols {
+  width: 10px;
+  height: 0;
+  border-top: 1.2px dashed color-mix(in srgb, var(--text-secondary) 75%, var(--surface-panel));
+  margin-left: 3px;
+}
+
+.sstep-fit-delta {
+  font-size: var(--fs-xs);
+}
+
+/* --- 4. 极简高密度模型总览列表 (Minimalist Session Model Summary Cards) --- */
+.smodel-section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.smodel-section-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 2px 1px 0;
+}
+
+.smodel-empty {
+  padding: var(--space-5) var(--space-3);
+  text-align: center;
+  font-size: var(--fs-md);
+  border: 1px dashed var(--border-hairline);
+  border-radius: var(--radius-xs);
+}
+
+.smodel-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.smodel-card {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 7px 10px;
+  background: var(--surface-panel);
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-xs);
+  cursor: pointer;
+  transition:
+    background var(--dur-instant) var(--ease-fast),
+    border-color var(--dur-instant) var(--ease-fast);
+}
+
+.smodel-card:hover {
+  background: var(--surface-hover);
+}
+
+.smodel-card.is-fit-active {
+  border-color: var(--accent-primary-border);
+  background: color-mix(in srgb, var(--accent-primary) 4.5%, var(--surface-panel));
+}
+
+.smodel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+}
+
+.smodel-ident {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.smodel-name {
+  font-size: var(--fs-base);
+  font-weight: 600;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.smodel-calls-pill {
+  flex-shrink: 0;
+  font-size: var(--fs-xs);
+  font-weight: 500;
+  padding: 1px 5px;
+  color: var(--text-secondary);
+  background: var(--surface-track);
+  border-radius: var(--radius-xs);
+}
+
+.smodel-totals {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.smodel-tok {
+  font-size: var(--fs-base-sm);
+  font-weight: 500;
+  color: var(--text-secondary);
+}
+
+.smodel-cost {
+  font-size: var(--fs-base);
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+.smodel-seg-bar {
+  height: 3.5px;
+}
+
+.smodel-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 2px 10px;
+  font-size: var(--fs-sm);
+  color: var(--text-secondary);
+}
+
+.smodel-perf {
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.smodel-split {
+  color: var(--text-muted);
+  white-space: nowrap;
 }

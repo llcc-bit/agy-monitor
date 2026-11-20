@@ -1,11 +1,13 @@
 {
   "name": "agy-monitor-panel",
-  "version": "1.4.5",
+  "version": "1.5.2",
   "private": true,
   "type": "module",
-  "description": "Sidecar backend and web UI for agy-monitor (Antigravity Usage & Live Speed Monitor).",
+  "description": "Sidecar backend and web UI for AGY Monitor.",
   "scripts": {
     "build": "node scripts/build-bundle.mjs",
+    "pack:release": "node scripts/pack-release-zip.mjs",
+    "standalone": "node standalone.mjs",
     "test": "node --test test/*.test.mjs"
   }
 }
