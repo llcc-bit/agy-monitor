@@ -10,7 +10,7 @@
 
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { inferCompactionStepModels, normalizeCachedStep } from '../trajectory-metrics.mjs';
 import { writeTrajectoryCacheFile } from './trajectory-cache-file.mjs';
@@ -108,10 +108,32 @@ function resolveProductDataRoots() {
 }
 
 /**
- * 插件持久化数据目录（默认由 Antigravity 宿主注入 `~/.gemini/antigravity/sidecar_data/usage-monitor/panel/data`）。
+ * 解析当前插件在 `sidecar_data/<pluginSlug>/panel/data` 下对应的目录名（优先读取 `plugin.json` 的 `name` 字段）。
+ * 防止改名衍生插件（如 `agy-monitor`）在 Sidecar 与独立 `bridge-daemon` 进程之间读取到两份分离的设置与租约文件。
+ */
+function resolvePluginDataSlug() {
+  try {
+    if (existsSync(PLUGIN_MANIFEST_FILE)) {
+      const manifest = JSON.parse(readFileSync(PLUGIN_MANIFEST_FILE, 'utf8'));
+      const rawName = String(manifest?.name || '').trim();
+      if (rawName && /^[a-z0-9._-]+$/i.test(rawName)) {
+        return rawName;
+      }
+    }
+  } catch {
+    // 忽略清单读取异常，回退目录名
+  }
+  const dirName = basename(PLUGIN_ROOT);
+  if (dirName && /^[a-z0-9._-]+$/i.test(dirName)) {
+    return dirName;
+  }
+  return 'usage-monitor';
+}
+
+/**
+ * 插件持久化数据目录（按当前插件标识解析 `~/.gemini/antigravity/sidecar_data/<pluginSlug>/panel/data`）。
  * 兼容桌面端、Antigravity IDE 与无头 `agy` CLI（`~/.gemini/antigravity-cli`）：
- * 优先使用已存在的持久化目录，纯 CLI 服务器自动落入 `~/.gemini/antigravity-cli/sidecar_data/usage-monitor/panel/data`，
- * 避免落入插件源码目录而在自更新时丢失缓存与设置。
+ * 确保 Sidecar 宿主进程与独立 MCP `bridge-daemon` 始终读写同一份配置与租约文件。
  */
 function resolveDefaultDataDir() {
   const explicitDataDir = String(process.env.USAGE_MONITOR_DATA_DIR || '').trim();
@@ -127,9 +149,10 @@ function resolveDefaultDataDir() {
   const geminiBase = resolveGeminiBaseDir();
   const antigravityRoot = join(geminiBase, 'antigravity');
   const cliRoot = join(geminiBase, 'antigravity-cli');
-  const panelDataDir = join(antigravityRoot, 'sidecar_data', 'usage-monitor', 'panel', 'data');
-  const legacyDataDir = join(antigravityRoot, 'sidecar_data', 'usage-monitor', 'data');
-  const cliPanelDataDir = join(cliRoot, 'sidecar_data', 'usage-monitor', 'panel', 'data');
+  const pluginSlug = resolvePluginDataSlug();
+  const panelDataDir = join(antigravityRoot, 'sidecar_data', pluginSlug, 'panel', 'data');
+  const legacyDataDir = join(antigravityRoot, 'sidecar_data', pluginSlug, 'data');
+  const cliPanelDataDir = join(cliRoot, 'sidecar_data', pluginSlug, 'panel', 'data');
   if (existsSync(panelDataDir)) return panelDataDir;
   if (existsSync(legacyDataDir)) return legacyDataDir;
   if (existsSync(cliPanelDataDir)) return cliPanelDataDir;

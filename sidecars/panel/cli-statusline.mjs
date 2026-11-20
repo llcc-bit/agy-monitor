@@ -51,6 +51,8 @@ function loadFreshestCliStatusSnapshot(geminiBase) {
   }
   const candidates = [
     CLI_STATUS_SNAPSHOT_FILE,
+    join(geminiBase, 'antigravity', 'sidecar_data', 'agy-monitor', 'panel', 'data', 'cli-status-snapshot.json'),
+    join(geminiBase, 'antigravity-cli', 'sidecar_data', 'agy-monitor', 'panel', 'data', 'cli-status-snapshot.json'),
     join(geminiBase, 'antigravity', 'sidecar_data', 'usage-monitor', 'panel', 'data', 'cli-status-snapshot.json'),
     join(geminiBase, 'antigravity-cli', 'sidecar_data', 'usage-monitor', 'panel', 'data', 'cli-status-snapshot.json'),
   ];
